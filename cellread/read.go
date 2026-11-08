@@ -294,7 +294,7 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	}
 	var quicks []quick
 	for _, f := range fonts {
-		t, _ := f.templates(round2(pg.pitch/f.advance), pg.w, pg.h, pg.baseline, []float64{0})
+		t, _ := f.templates(round2(pg.pitch/f.Advance), pg.w, pg.h, pg.baseline, []float64{0})
 		// Every other offset first, then the neighbours of the best: a coarse
 		// step alone can skip one font's baseline and land on another's.
 		dy, dx, _ := pg.fitShift(few, t, dys2, dxs2)
@@ -308,13 +308,13 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	var short []*Font
 	fams := map[string]bool{}
 	for _, q := range quicks {
-		if fams[q.f.family] || len(fams) == 8 {
+		if fams[q.f.Family] || len(fams) == 8 {
 			continue
 		}
-		fams[q.f.family] = true
+		fams[q.f.Family] = true
 		short = append(short, q.f)
 		for _, f := range fonts {
-			if f.family == q.f.family && f != q.f && f.weight == 400 {
+			if f.Family == q.f.Family && f != q.f && f.Weight == 400 {
 				short = append(short, f)
 				break
 			}
@@ -325,13 +325,13 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	// It is searched widely once, then only nearby for each candidate, since
 	// fonts and sizes move glyphs by a pixel or two at most.
 	lead := quicks[0].f
-	t0, _ := lead.templates(round2(pg.pitch/lead.advance), pg.w, pg.h, pg.baseline, []float64{0})
+	t0, _ := lead.templates(round2(pg.pitch/lead.Advance), pg.w, pg.h, pg.baseline, []float64{0})
 	dyAll, dxAll, _ := pg.fitShift(sample, t0, dys, dxs)
 	near := func(c, lo, hi int) []int { return span1(max(c-lo, -hi), min(c+lo, hi), 1) }
 	var ranked []candidate
 	for _, f := range short {
 		for _, mul := range []float64{1, 0.985, 0.97, 1.015} {
-			size := round2(pg.pitch / f.advance * mul)
+			size := round2(pg.pitch / f.Advance * mul)
 			t0, _ := f.templates(size, pg.w, pg.h, pg.baseline, []float64{0})
 			fit := candidate{font: f, size: size}
 			fit.dy, fit.dx, fit.score = pg.fitShift(sample, t0, near(dyAll, 3, pg.h), near(dxAll, 2, pg.w))
@@ -361,16 +361,16 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	for _, c := range ranked {
 		key := [2]float64{math.Round(c.score * 1e6), c.size}
 		if _, seen := copies[key]; seen {
-			if !used[c.font.family] {
-				used[c.font.family] = true
+			if !used[c.font.Family] {
+				used[c.font.Family] = true
 				copies[key] = append(copies[key], c)
 			}
 			continue
 		}
-		if used[c.font.family] {
+		if used[c.font.Family] {
 			continue
 		}
-		used[c.font.family] = true
+		used[c.font.Family] = true
 		copies[key] = nil
 		t, l := pg.templatesFor(c.font, c.size)
 		rd := pg.readRows(t, c.dy, []int{c.dx - 1, c.dx, c.dx + 1})

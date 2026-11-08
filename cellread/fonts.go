@@ -2,6 +2,7 @@ package cellread
 
 import (
 	"bytes"
+	"encoding/gob"
 	"errors"
 	"image"
 	"io/fs"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/go-text/typesetting/di"
@@ -22,11 +24,31 @@ import (
 
 // Font is one installed monospace face that text on screen might be drawn in.
 type Font struct {
-	Name    string // file name, for reporting which font was picked
-	family  string // normalised, so a family's weights and Nerd Font builds group together
-	weight  font.Weight
-	face    *font.Face
-	advance float64 // cell width per pixel of font size
+	Name string // file name, for reporting which font was picked
+	fontData
+}
+
+// fontData is all that reading needs from a font file: about a hundred glyph
+// outlines, a few heights and the operators as the font shapes them. A parsed
+// font file holds far more, up to tens of megabytes for a Nerd Font, so only
+// this is kept, and cached between runs.
+type fontData struct {
+	Family  string // normalised, so a family's weights and Nerd Font builds group together
+	Weight  float32
+	Advance float64 // cell width per pixel of font size
+	Upem    float32
+	// Marks are the heights snapHeights rounds, in font units: the bottom of
+	// p or g, the baseline, x-height, cap height and the top of l or d.
+	Marks    []float32
+	Glyphs   map[rune]font.GID // printable ASCII
+	Outlines map[font.GID][]ot.Segment
+	Ops      map[string][]placed // operators shaped by the font
+}
+
+// placed is one glyph of a shaped operator, in font units.
+type placed struct {
+	GID           font.GID
+	X, Y, Advance float32
 }
 
 var errNoFonts = errors.New("no monospace fonts found")
@@ -49,7 +71,14 @@ func fontDirs() []string {
 // InstalledFonts finds the upright monospace fonts, regular to bold,
 // installed on this machine. Text drawn on this screen used one of them, so
 // they are the candidates for reading it back. Nothing is downloaded.
+//
+// What each font file yields is cached in the user cache directory, keyed by
+// path, size and modification time, so later runs parse only new or changed
+// files. Without a cache directory every file is parsed, one at a time.
 func InstalledFonts() ([]*Font, error) {
+	cache, cachePath := loadFontCache()
+	fresh := fontCache{}
+	changed := false
 	seen := map[string]bool{}
 	var out []*Font
 	for _, dir := range fontDirs() {
@@ -66,11 +95,24 @@ func InstalledFonts() ([]*Font, error) {
 				return nil
 			}
 			seen[real] = true
-			if f := loadFont(real); f != nil {
-				out = append(out, f)
+			info, err := os.Stat(real)
+			if err != nil {
+				return nil
+			}
+			e, ok := cache[real]
+			if !ok || e.Size != info.Size() || e.ModTime != info.ModTime().UnixNano() {
+				e = cacheEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Data: loadFont(real)}
+				changed = true
+			}
+			fresh[real] = e
+			if e.Data != nil {
+				out = append(out, &Font{Name: filepath.Base(real), fontData: *e.Data})
 			}
 			return nil
 		})
+	}
+	if changed || len(fresh) != len(cache) {
+		saveFontCache(cachePath, fresh)
 	}
 	if len(out) == 0 {
 		return nil, errNoFonts
@@ -79,7 +121,7 @@ func InstalledFonts() ([]*Font, error) {
 }
 
 // loadFont returns nil for anything that can't sit on a monospace grid.
-func loadFont(path string) *Font {
+func loadFont(path string) *fontData {
 	// Proportional Nerd Font builds keep a mono family name but vary widths.
 	if strings.Contains(strings.ToLower(filepath.Base(path)), "propo") || !fixedPitch(path) {
 		return nil
@@ -92,7 +134,7 @@ func loadFont(path string) *Font {
 	if err != nil {
 		return nil
 	}
-	return newFont(filepath.Base(path), face)
+	return extract(face)
 }
 
 // fixedPitch reads only the post table's isFixedPitch flag, so checking every
@@ -116,7 +158,9 @@ func fixedPitch(path string) bool {
 
 var familySuffix = regexp.MustCompile(`(nerdfontmono|nerdfontpropo|nerdfont|nfm|nfp|nf)$`)
 
-func newFont(name string, face *font.Face) *Font {
+// extract keeps what reading needs from a parsed font, or returns nil for a
+// font that isn't upright, regular to bold, and monospace.
+func extract(face *font.Face) *fontData {
 	desc := face.Describe()
 	if desc.Aspect.Style != font.StyleNormal || desc.Aspect.Weight < 350 || desc.Aspect.Weight > 700 {
 		return nil
@@ -131,13 +175,48 @@ func newFont(name string, face *font.Face) *Font {
 		return nil
 	}
 	fam := strings.ToLower(strings.ReplaceAll(desc.Family, " ", ""))
-	return &Font{
-		Name:    name,
-		family:  familySuffix.ReplaceAllString(fam, ""),
-		weight:  desc.Aspect.Weight,
-		face:    face,
-		advance: float64(am) / float64(face.Upem()),
+	upem := float32(face.Upem())
+	d := &fontData{
+		Family:   familySuffix.ReplaceAllString(fam, ""),
+		Weight:   float32(desc.Aspect.Weight),
+		Advance:  float64(am) / float64(upem),
+		Upem:     upem,
+		Marks:    []float32{extreme(face, -1, 'p', 'g'), 0, face.LineMetric(font.XHeight), face.LineMetric(font.CapHeight), extreme(face, 1, 'l', 'd')},
+		Glyphs:   map[rune]font.GID{},
+		Outlines: map[font.GID][]ot.Segment{},
+		Ops:      map[string][]placed{},
 	}
+	keep := func(gid font.GID) {
+		if _, ok := d.Outlines[gid]; ok {
+			return
+		}
+		if outline, ok := face.GlyphDataOutline(gid); ok {
+			d.Outlines[gid] = slices.Clone(outline.Segments)
+		} else {
+			d.Outlines[gid] = nil
+		}
+	}
+	for ch := rune(33); ch < 127; ch++ {
+		if gid, ok := face.NominalGlyph(ch); ok {
+			d.Glyphs[ch] = gid
+			keep(gid)
+		}
+	}
+	// Shaped at one pixel per font unit, so positions come out in font units
+	// and scale to any size.
+	shaper := &shaping.HarfbuzzShaper{}
+	for _, op := range operators {
+		text := []rune(op)
+		res := shaper.Shape(shaping.Input{
+			Text: text, RunStart: 0, RunEnd: len(text), Direction: di.DirectionLTR, Face: face,
+			Size: fixed.I(int(upem)), Script: language.Latin, Language: language.NewLanguage("en"),
+		})
+		for _, g := range res.Glyphs {
+			keep(g.GlyphID)
+			d.Ops[op] = append(d.Ops[op], placed{g.GlyphID, float32(g.XOffset) / 64, float32(g.YOffset) / 64, float32(g.Advance) / 64})
+		}
+	}
+	return d
 }
 
 // LoadFont reads one font file, for callers that know the font in advance.
@@ -146,28 +225,87 @@ func LoadFont(name string, data []byte) (*Font, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := newFont(name, face)
-	if f == nil {
+	d := extract(face)
+	if d == nil {
 		return nil, errors.New("not an upright regular monospace font")
 	}
-	return f, nil
+	return &Font{Name: name, fontData: *d}, nil
+}
+
+// cacheVersion changes whenever fontData does, so old caches are ignored.
+const cacheVersion = 1
+
+type cacheEntry struct {
+	Size, ModTime int64
+	Data          *fontData // nil for a file that isn't a usable monospace font
+}
+
+type fontCache map[string]cacheEntry
+
+type cacheFile struct {
+	Version int
+	Fonts   fontCache
+}
+
+// loadFontCache returns the cached fonts and where the cache lives, or an
+// empty cache if there is none or it can't be read.
+func loadFontCache() (fontCache, string) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return fontCache{}, ""
+	}
+	path := filepath.Join(dir, "keming", "fonts.gob")
+	f, err := os.Open(path)
+	if err != nil {
+		return fontCache{}, path
+	}
+	defer f.Close()
+	var c cacheFile
+	if err := gob.NewDecoder(f).Decode(&c); err != nil || c.Version != cacheVersion || c.Fonts == nil {
+		return fontCache{}, path
+	}
+	return c.Fonts, path
+}
+
+// saveFontCache writes the cache whole, through a temporary file, so a
+// reader running at the same time sees the old cache or the new one. A cache
+// that can't be written only costs the next run time.
+func saveFontCache(path string, c fontCache) {
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "fonts-*.gob")
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmp.Name())
+	if err := gob.NewEncoder(tmp).Encode(cacheFile{cacheVersion, c}); err != nil {
+		tmp.Close()
+		return
+	}
+	if tmp.Close() == nil {
+		os.Rename(tmp.Name(), path)
+	}
 }
 
 // glyph draws one outline into a w x h cell: pen at x, baseline at y, size in
 // pixels per em. The rasterizer computes exact pixel coverage, which stands in
 // for any renderer's antialiasing.
 func (f *Font) glyph(gid font.GID, size, x, y float64, snap hinting, z *vector.Rasterizer) {
-	outline, ok := f.face.GlyphDataOutline(gid)
+	segments, ok := f.Outlines[gid]
 	if !ok {
 		return
 	}
-	s := float32(size / float64(f.face.Upem()))
+	s := float32(size) / f.Upem
 	lift := func(v float32) float32 { return v * s }
 	if snap != unhinted {
 		lift = f.snapHeights(s, snap == compactHinted)
 	}
 	px := func(p ot.SegmentPoint) (float32, float32) { return float32(x) + p.X*s, float32(y) - lift(p.Y) }
-	for _, seg := range outline.Segments {
+	for _, seg := range segments {
 		switch seg.Op {
 		case ot.SegmentOpMoveTo:
 			z.MoveTo(px(seg.Args[0]))
@@ -198,10 +336,8 @@ func (f *Font) glyph(gid font.GID, size, x, y float64, snap hinting, z *vector.R
 // the ascender down to the cap height instead. With compact set, the ascender
 // rounds down, so a template exists for that as well.
 func (f *Font) snapHeights(s float32, compact bool) func(float32) float32 {
-	// Heights in font units, from the bottom of p to the top of l or d.
-	marks := []float32{f.extreme(-1, 'p', 'g'), 0, f.face.LineMetric(font.XHeight), f.face.LineMetric(font.CapHeight), f.extreme(1, 'l', 'd')}
-	from := make([]float32, 0, len(marks))
-	for _, m := range marks {
+	from := make([]float32, 0, len(f.Marks))
+	for _, m := range f.Marks {
 		v := m * s
 		// A mark the font lacks, or out of order, is skipped.
 		if len(from) == 0 || v > from[len(from)-1] {
@@ -231,14 +367,14 @@ func (f *Font) snapHeights(s float32, compact bool) func(float32) float32 {
 
 // extreme is the highest top (dir 1) or lowest bottom (dir -1) of the given
 // glyphs, in font units, or 0 if the font has none of them.
-func (f *Font) extreme(dir float32, chars ...rune) float32 {
+func extreme(face *font.Face, dir float32, chars ...rune) float32 {
 	var out float32
 	for _, ch := range chars {
-		gid, ok := f.face.NominalGlyph(ch)
+		gid, ok := face.NominalGlyph(ch)
 		if !ok {
 			continue
 		}
-		e, ok := f.face.GlyphExtents(gid)
+		e, ok := face.GlyphExtents(gid)
 		if !ok {
 			continue
 		}
@@ -283,7 +419,7 @@ func (f *Font) templates(size float64, w, h int, baseline float64, phases []floa
 	var labels []rune
 	z := vector.NewRasterizer(w, h)
 	for ch := rune(33); ch < 127; ch++ {
-		gid, ok := f.face.NominalGlyph(ch)
+		gid, ok := f.Glyphs[ch]
 		if !ok {
 			continue
 		}
@@ -314,24 +450,19 @@ var operators = []string{"->", "=>", "<-", "==", "===", "!=", "!==", ">=", "<=",
 	"<<", ">>", "//", "/*", "*/", "..", "...", "<>", "|>", "<|", "#!", "www", "__", "**", "?.", "??", "!!", "%%", "#{", "${",
 	"/>", "</", "~>", "<~", "=~", "!~"}
 
-// operatorTemplates draws each operator with the font's own shaping, which is
+// operatorTemplates draws each operator as the font shapes it, which is
 // where ligatures come from. Fonts without ligatures draw plain characters,
 // which then never beat reading the cells one by one.
 func (f *Font) operatorTemplates(size, pitch float64, h int, baseline float64) map[string][]float32 {
-	shaper := &shaping.HarfbuzzShaper{}
+	scale := size / float64(f.Upem)
 	out := map[string][]float32{}
 	for _, op := range operators {
-		text := []rune(op)
-		res := shaper.Shape(shaping.Input{
-			Text: text, RunStart: 0, RunEnd: len(text), Direction: di.DirectionLTR, Face: f.face,
-			Size: fixed.Int26_6(math.Round(size * 64)), Script: language.Latin, Language: language.NewLanguage("en"),
-		})
-		w := int(math.Round(pitch * float64(len(text))))
+		w := int(math.Round(pitch * float64(len([]rune(op)))))
 		z := vector.NewRasterizer(w, h)
 		pen := 0.0
-		for _, g := range res.Glyphs {
-			f.glyph(g.GlyphID, size, pen+float64(g.XOffset)/64, baseline-float64(g.YOffset)/64, unhinted, z)
-			pen += float64(g.Advance) / 64
+		for _, g := range f.Ops[op] {
+			f.glyph(g.GID, size, pen+float64(g.X)*scale, baseline-float64(g.Y)*scale, unhinted, z)
+			pen += float64(g.Advance) * scale
 		}
 		out[op] = unit(coverage(z, w, h))
 	}
