@@ -508,15 +508,36 @@ func Read(img image.Image, fonts []*Font) (Result, error) {
 	if len(fonts) == 0 {
 		return Result{}, errNoFonts
 	}
+	p, err := Prepare(img)
+	if err != nil {
+		return Result{}, err
+	}
+	return p.Read(fonts)
+}
+
+// Page is an image whose character grid has been found.
+type Page struct{ pg *page }
+
+// Prepare finds the character grid in img, taking milliseconds, so a caller
+// can learn whether the image is monospace text before loading any fonts or
+// starting another reader. It returns ErrNoText or ErrNotMonospace if not.
+func Prepare(img image.Image) (*Page, error) {
 	pg, ok := newPage(img)
 	if !ok {
-		return Result{}, ErrNoText
+		return nil, ErrNoText
 	}
-	// Checked before matching any font, which on a large page of proportional
-	// text would take minutes to find nothing.
 	if pg.k.gridFit(pg.rows, pg.pitch, pg.x0) > maxBorderInk {
-		return Result{}, ErrNotMonospace
+		return nil, ErrNotMonospace
 	}
+	return &Page{pg}, nil
+}
+
+// Read reads the page's text, matching it against fonts.
+func (p *Page) Read(fonts []*Font) (Result, error) {
+	if len(fonts) == 0 {
+		return Result{}, errNoFonts
+	}
+	pg := p.pg
 	c, t, labels, rd, copies := pg.chooseFont(fonts)
 	ops := pg.findOps(c, rd)
 	// A copy of the font can only differ in its ligatures, so it wins only by

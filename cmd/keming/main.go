@@ -52,6 +52,7 @@ func main() {
 var engines = []string{"auto", "cells", "rapid", "tesseract"}
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+
 	fs := flag.NewFlagSet("keming", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	lang := fs.String("l", "eng", "language, for tesseract; see tesseract --list-langs")
@@ -76,15 +77,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	useCells := *engine == "auto" || *engine == "cells"
 
 	// The slow parts start before the image is read; see the package doc.
-	type loaded struct {
-		fonts []*cellread.Font
-		err   error
-	}
-	fonts := make(chan loaded, 1)
+	fonts := make(chan loadedFonts, 1)
 	if useCells {
 		go func() {
 			f, err := cellread.InstalledFonts()
-			fonts <- loaded{f, err}
+			fonts <- loadedFonts{f, err}
 		}()
 	}
 	var read func(image.Image) (string, error)
@@ -107,32 +104,26 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	// Both readers run at once, so trying the cell reader first costs no time
-	// beyond its own.
-	cellsDone := make(chan cellReading, 1)
-	if useCells {
-		go func() {
-			l := <-fonts
-			if l.err != nil {
-				cellsDone <- cellReading{err: l.err}
-				return
-			}
-			res, err := cellread.Read(img, l.fonts)
-			cellsDone <- cellReading{res, err}
-		}()
-	}
+	// The grid check takes milliseconds and decides which reader to run, so
+	// only one runs: the cell reader on monospace text, falling back to the
+	// other reader if it is unsure, and the other reader on anything else.
 	var text, why string
 	switch {
 	case read == nil:
-		c := <-cellsDone
+		c := readCells(img, fonts)
 		text, err = c.res.Text, c.err
 		why = fmt.Sprintf("cell reader (%s, match %.2f), as asked", c.res.Font, c.res.Score)
 	case !useCells:
 		text, err = read(img)
 		why = name + ", as asked"
 	default:
+		c := readCells(img, fonts)
+		if c.err == nil && c.res.Score >= monoConfident {
+			text, why, err = choose(c, textReading{})
+			break
+		}
 		t, terr := read(img)
-		text, why, err = choose(<-cellsDone, textReading{name, t, terr})
+		text, why, err = choose(c, textReading{name, t, terr})
 	}
 	if *verbose {
 		fmt.Fprintln(stderr, "keming: read by", why)
@@ -142,6 +133,26 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 	_, err = fmt.Fprintln(stdout, text)
 	return err
+}
+
+type loadedFonts struct {
+	fonts []*cellread.Font
+	err   error
+}
+
+// readCells reads img with the cell reader, waiting for fonts only once the
+// grid check has passed.
+func readCells(img image.Image, fonts <-chan loadedFonts) cellReading {
+	page, err := cellread.Prepare(img)
+	if err != nil {
+		return cellReading{err: err}
+	}
+	l := <-fonts
+	if l.err != nil {
+		return cellReading{err: l.err}
+	}
+	res, err := page.Read(l.fonts)
+	return cellReading{res, err}
 }
 
 // pickEngine names the reader for text that isn't monospace and finds its
