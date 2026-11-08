@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Reads a PNG on stdin with PP-OCRv6 small and prints each box it finds as
+JSON: [{"text": ..., "score": ..., "box": [[x, y], ...]}]. keming
+runs this when it is on PATH, and puts the boxes into lines itself.
+
+Runs on the CPU and offline, once RapidOCR has its models. See README.md.
+"""
+import json
+import sys
+
+from rapidocr import LangDet, LangRec, ModelType, OCRVersion, RapidOCR
+
+engine = RapidOCR(params={
+    "Det.ocr_version": OCRVersion.PPOCRV6, "Det.model_type": ModelType.SMALL, "Det.lang_type": LangDet.EN,
+    "Rec.ocr_version": OCRVersion.PPOCRV6, "Rec.model_type": ModelType.SMALL, "Rec.lang_type": LangRec.EN,
+    # Screen text: keep faint and short boxes such as a lone brace, and skip
+    # the rotation check, since screenshots are upright.
+    "Global.text_score": 0.1, "Global.use_cls": False, "Det.box_thresh": 0.3,
+    # Every core by default, which on 16 was slower than 4 and used four
+    # times the CPU.
+    "EngineConfig.onnxruntime.intra_op_num_threads": 4,
+    "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+})
+result = engine(sys.stdin.buffer.read())
+boxes = []
+if result.txts:
+    for text, score, box in zip(result.txts, result.scores, result.boxes):
+        boxes.append({"text": text, "score": float(score), "box": [[float(x), float(y)] for x, y in box]})
+json.dump(boxes, sys.stdout)
