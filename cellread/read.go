@@ -18,6 +18,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"golang.org/x/image/vector"
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrNoText means the image holds nothing that looks like text.
@@ -590,6 +593,112 @@ func (pg *page) wideGlyphs(rd reading, ops map[[2]int]rune) map[[2]int]bool {
 	return wide
 }
 
+// dropMissingMarks reads a cell as its letter without the accent when the
+// accent isn't on screen. A template only scores how alike shapes are, and
+// in Go Mono an I matched Ī better than I, and E matched Ē as well as E,
+// with nothing above either; so a letter read with a mark keeps it only if
+// there is ink where the mark is drawn.
+func (pg *page) dropMissingMarks(f *Font, size float64, chars map[[2]int]rune, rd reading, dx int) {
+	z := vector.NewRasterizer(pg.w, pg.h)
+	draw := func(ch rune) []float32 {
+		gid, ok := f.Glyphs[ch]
+		if !ok {
+			return nil
+		}
+		z.Reset(pg.w, pg.h)
+		f.glyph(gid, size, 0, pg.baseline, unhinted, z)
+		c := coverage(z, pg.w, pg.h)
+		for i := range c {
+			c[i] /= 255
+		}
+		return c
+	}
+	type mark struct {
+		base     rune
+		px, body []image.Point // where the mark is drawn, and the rest
+	}
+	marks := map[rune]*mark{}
+	for id, pos := range pg.where {
+		ch := chars[pos]
+		if ch <= '~' {
+			continue
+		}
+		m, ok := marks[ch]
+		if !ok {
+			m = &mark{}
+			marks[ch] = m
+			base := []rune(norm.NFD.String(string(ch)))[0]
+			if a, b := draw(ch), draw(base); base <= '~' && a != nil && b != nil {
+				m.base, m.px = base, markPixels(a, b, pg.w)
+				for i := range a {
+					if a[i] > 0.5 && b[i] > 0.5 {
+						m.body = append(m.body, image.Pt(i%pg.w, i/pg.w))
+					}
+				}
+			}
+		}
+		if len(m.px) > 0 && !pg.markInked(pg.boxes[id], m.px, m.body, dx, rd.dy[id]) {
+			chars[pos] = m.base
+		}
+	}
+}
+
+// markPixels are where accented, drawn w wide, has ink that base, the
+// letter without the accent, doesn't: those above or below base where there
+// are any, as marks mostly are, or else all of them, as for í, whose acute
+// takes the place of i's dot.
+func markPixels(accented, base []float32, w int) []image.Point {
+	top, bottom := len(base)/w, -1
+	for i, v := range base {
+		if v > 0.5 {
+			top, bottom = min(top, i/w), max(bottom, i/w)
+		}
+	}
+	var all, outside []image.Point
+	for i := range accented {
+		if accented[i]-base[i] > 0.5 {
+			p := image.Pt(i%w, i/w)
+			all = append(all, p)
+			if p.Y < top-1 || p.Y > bottom+1 {
+				outside = append(outside, p)
+			}
+		}
+	}
+	if len(outside) > 0 {
+		return outside
+	}
+	return all
+}
+
+// markInked reports whether the cell at box, shifted as it was read, has
+// ink where a mark is drawn at px. Hinting moves a glyph by a pixel or so,
+// so the cell is first lined up on body, the strokes the letter shares with
+// its base; then the mark is looked for there and nowhere else. Allowing a
+// pixel's slack for the mark itself let a plain i's dot pass for the acute
+// of í, a pixel away; lined up, false marks had no ink, and real ones in
+// twelve languages had 0.39 or more.
+func (pg *page) markInked(box image.Point, px, body []image.Point, dx, dy int) bool {
+	inkOver := func(px []image.Point, dx, dy int) float64 {
+		sum := 0.0
+		for _, p := range px {
+			x, y := box.X+dx+p.X, box.Y+dy+p.Y
+			if x >= 0 && x < pg.k.w && y >= 0 && y < pg.k.h {
+				sum += float64(pg.k.at(x, y))
+			}
+		}
+		return sum / float64(len(px))
+	}
+	bx, by, best := dx, dy, -1.0
+	for ddy := -1; ddy <= 1; ddy++ {
+		for ddx := -1; ddx <= 1; ddx++ {
+			if v := inkOver(body, dx+ddx, dy+ddy); len(body) > 0 && v > best {
+				bx, by, best = dx+ddx, dy+ddy, v
+			}
+		}
+	}
+	return inkOver(px, bx, by) >= 0.2
+}
+
 // cmpPos orders cells by row, then column.
 func cmpPos(a, b [2]int) int {
 	if a[0] != b[0] {
@@ -698,6 +807,7 @@ func (p *Page) Read(fonts []*Font) (Result, error) {
 	for id, pos := range pg.where {
 		chars[pos] = labels[rd.picks[id]]
 	}
+	pg.dropMissingMarks(c.font, c.size, chars, rd, c.dx)
 	for pos, ch := range ops {
 		chars[pos] = ch
 	}

@@ -92,6 +92,7 @@ func TestReadsCodeExactly(t *testing.T) {
 		{"small text", dark, 12, "for i := 0; i < n; i++ {\n\tsum += xs[i]\n}"},
 		// Read as ASCII, these came out as GruBe and ano, scored 0.99.
 		{"accented letters", dark, 16, "msg := \"Grüße aus München\"\n// Configuración: año=2026, 5€\nÄÖÜ äöü ß ¿¡ ñÑ éÉ çÇ øØ åÅ"},
+		{"central European and Turkish letters", dark, 16, "// Zażółć gęślą jaźń\nmsg := \"Příliš žluťoučký kůň\"\nIşık ğüşö İstanbul, Győr"},
 	}
 	fonts := goMono(t)
 	for _, c := range cases {

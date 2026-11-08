@@ -292,7 +292,7 @@ func LoadFonts(name string, data []byte) ([]*Font, error) {
 
 // cacheVersion changes whenever what is cached does, so old caches are
 // ignored.
-const cacheVersion = 3
+const cacheVersion = 4
 
 type cacheEntry struct {
 	Size, ModTime int64
@@ -487,26 +487,36 @@ var ascii = func() []rune {
 	return r
 }()
 
-// latinLetters are the accented letters of Latin-1, for Spanish, German, French,
-// Portuguese and the Nordic languages, with the letters Latin-1 lacks for
-// French and Finnish, Spanish's ¡ and ¿, and the euro sign. Read as ASCII,
-// Grüße came out as GruBe. Latin-1's other symbols stay out: they look like
-// ASCII marks, and the cedilla took the underscore in LOG_LEVEL.
+// latinLetters are the accented letters of Latin-1 and Latin Extended-A,
+// for the languages of western and central Europe, the Baltic and Turkey,
+// with Romanian's ș and ț, Vietnamese, Spanish's ¡ and ¿, and the euro sign.
+// Read as ASCII, Grüße came out as GruBe. Latin-1's symbols stay out: they
+// look like ASCII marks, and the cedilla took the underscore in LOG_LEVEL.
+// So do the long s, which looks like an f, and the obsolete ŉ and ĸ.
 var latinLetters = func() []rune {
 	r := []rune{'¡', '¿'}
-	for ch := rune(0xc0); ch <= 0xff; ch++ {
-		if ch != '×' && ch != '÷' {
-			r = append(r, ch)
+	add := func(lo, hi rune) {
+		for ch := lo; ch <= hi; ch++ {
+			if ch != '×' && ch != '÷' && ch != 'ŉ' && ch != 'ĸ' && ch != 'ſ' {
+				r = append(r, ch)
+			}
 		}
 	}
-	return append(r, 'Œ', 'œ', 'Š', 'š', 'Ž', 'ž', 'Ÿ', '€')
+	add(0xc0, 0xff)     // Latin-1
+	add(0x100, 0x17f)   // Latin Extended-A
+	add(0x218, 0x21b)   // Ș ș Ț ț
+	add(0x1a0, 0x1a1)   // Ơ ơ
+	add(0x1af, 0x1b0)   // Ư ư
+	add(0x1ea0, 0x1ef9) // Vietnamese
+	return append(r, '€')
 }()
 
 // latinWeight scales the templates of letters outside ASCII, so they score
 // a little lower and only win a cell they clearly match. Unweighted, i read
-// as í all through a GitHub snippet in Liberation Mono; 0.98 and 0.97 read it
-// and real accents exactly, and 0.95 lost real accents.
-const latinWeight = 0.97
+// as í all through a GitHub snippet in Liberation Mono; 0.95 lost real
+// accents, and 0.97 the í of Czech's Příliš in JetBrains Mono. A mark that
+// isn't on screen is caught after, by dropMissingMarks.
+const latinWeight = 0.98
 
 // weigh scales v, a unit template of ch, by latinWeight when ch is outside
 // ASCII.
