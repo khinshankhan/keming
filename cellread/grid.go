@@ -330,7 +330,36 @@ func (k ink) cellPitch(bands []span) (pitch, x0 float64, ok bool) {
 			}
 		}
 	}
+	if pitch/2 >= math.Max(4, tall*0.35) && pairedCells(col, pitch, x0, first, last) {
+		pitch /= 2
+	}
 	return pitch, x0, pitch > 0
+}
+
+// pairedCells reports whether cells of pitch hold two glyphs each: more
+// than a third of those with ink have no ink down their middle. Twice the
+// pitch fits the borders of monospace text as cleanly as the pitch itself,
+// and better where Korean or Chinese, two cells wide, crosses its middle
+// border, so it can win. A cell of one Latin glyph nearly always has ink
+// down its middle.
+func pairedCells(col []float64, pitch, x0 float64, first, last int) bool {
+	clean, inked := 0, 0
+	for c := 0; x0+float64(c)*pitch <= float64(last); c++ {
+		l := max(int(math.Round(x0+float64(c)*pitch)), first)
+		r := min(int(math.Round(x0+float64(c+1)*pitch)), last+1)
+		ink := false
+		for x := l; x < r; x++ {
+			ink = ink || col[x] > 0
+		}
+		if !ink {
+			continue
+		}
+		inked++
+		if mid := int(math.Round(x0 + (float64(c)+0.5)*pitch)); mid >= 0 && mid < len(col) && col[mid] == 0 {
+			clean++
+		}
+	}
+	return inked > 0 && clean*3 > inked
 }
 
 // occupied reports, per row, which cells hold a glyph. Only the middle of a
@@ -360,11 +389,15 @@ func (k ink) occupied(rows []span, pitch, x0 float64) [][]bool {
 
 // gridFit is how much ink the cell borders cross, relative to an average
 // column of the text: near 0 for monospace text, which keeps to its cells,
-// and well above for proportional text, whose glyphs fall anywhere.
-func (k ink) gridFit(rows []span, pitch, x0 float64) float64 {
-	var border, all float64
-	var nb, na int
-	for _, s := range rows {
+// and well above for proportional text, whose glyphs fall anywhere. The
+// border inside each pair in wide, by row and first column, is left out,
+// unless that is a third or more of the borders: a video call's grid came
+// out 195 pixels wide, and three words taken for wide glyphs left no border
+// crossed.
+func (k ink) gridFit(rows []span, pitch, x0 float64, wide map[[2]int]bool) float64 {
+	var border, all, inWide float64
+	var nb, na, nWide int
+	for r, s := range rows {
 		first, last := k.w, -1
 		col := make([]float64, k.w)
 		for y := s.a; y < s.b; y++ {
@@ -388,12 +421,73 @@ func (k ink) gridFit(rows []span, pitch, x0 float64) float64 {
 			if x > last {
 				break
 			}
+			if wide[[2]int{r, c - 1}] {
+				inWide += col[x]
+				nWide++
+				continue
+			}
 			border += col[x]
 			nb++
 		}
+	}
+	if 3*nWide >= nb+nWide {
+		border += inWide
+		nb += nWide
 	}
 	if nb == 0 || all == 0 {
 		return 1
 	}
 	return (border / float64(nb)) / (all / float64(na))
+}
+
+// widePairs finds the cell pairs that one glyph two cells wide covers, as a
+// terminal draws Chinese, Japanese and Korean, by row and first column. Ink
+// crosses the border between the pair, but not the borders either side, and
+// spans well over one cell and over half the line's height: == in a small
+// chat screenshot touched across the border, but is short. A ligature such
+// as != looks the same here; the reader tells them apart once it knows the
+// font.
+func (k ink) widePairs(rows []span, pitch, x0 float64) map[[2]int]bool {
+	out := map[[2]int]bool{}
+	ncol := int((float64(k.w)-x0)/pitch) + 1
+	for r, s := range rows {
+		crossed := func(c int) int { return k.crossed(s, x0, pitch, c) }
+		for c := 1; c < ncol; c++ {
+			if crossed(c) < 2 || crossed(c-1) > 1 || crossed(c+1) > 1 {
+				continue
+			}
+			left := max(int(math.Round(x0+float64(c-1)*pitch)), 0)
+			right := min(int(math.Round(x0+float64(c+1)*pitch)), k.w)
+			first, last, top, bottom := right, -1, s.b, -1
+			for y := s.a; y < s.b; y++ {
+				for x := left; x < right; x++ {
+					if k.at(x, y) > inkThreshold {
+						first, last = min(first, x), max(last, x)
+						top, bottom = min(top, y), max(bottom, y)
+					}
+				}
+			}
+			if float64(last-first+1) > 1.25*pitch && 2*(bottom-top+1) > s.b-s.a {
+				out[[2]int{r, c - 1}] = true
+				c++
+			}
+		}
+	}
+	return out
+}
+
+// crossed is how many pixels of ink in row s cross the left border of
+// column c.
+func (k ink) crossed(s span, x0, pitch float64, c int) int {
+	x := int(math.Round(x0 + float64(c)*pitch))
+	if x < 0 || x >= k.w {
+		return 0
+	}
+	n := 0
+	for y := s.a; y < s.b; y++ {
+		if k.at(x, y) > inkThreshold {
+			n++
+		}
+	}
+	return n
 }

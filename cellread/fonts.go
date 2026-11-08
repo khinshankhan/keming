@@ -254,7 +254,7 @@ func extract(face *font.Face, weight float32) *fontData {
 			d.Outlines[gid] = nil
 		}
 	}
-	for _, ch := range append(ascii, latin...) {
+	for _, ch := range append(ascii, latinLetters...) {
 		if gid, ok := face.NominalGlyph(ch); ok {
 			d.Glyphs[ch] = gid
 			keep(gid)
@@ -487,12 +487,12 @@ var ascii = func() []rune {
 	return r
 }()
 
-// latin are the accented letters of Latin-1, for Spanish, German, French,
+// latinLetters are the accented letters of Latin-1, for Spanish, German, French,
 // Portuguese and the Nordic languages, with the letters Latin-1 lacks for
 // French and Finnish, Spanish's ¡ and ¿, and the euro sign. Read as ASCII,
 // Grüße came out as GruBe. Latin-1's other symbols stay out: they look like
 // ASCII marks, and the cedilla took the underscore in LOG_LEVEL.
-var latin = func() []rune {
+var latinLetters = func() []rune {
 	r := []rune{'¡', '¿'}
 	for ch := rune(0xc0); ch <= 0xff; ch++ {
 		if ch != '×' && ch != '÷' {
@@ -520,16 +520,17 @@ func weigh(v []float32, ch rune) []float32 {
 	return v
 }
 
-// templates draws every character the font has, at each sub-pixel offset, as
-// unit vectors for matching. The quick font pass, with one offset, only
-// needs ASCII to tell fonts apart; reading needs the accented letters too.
-func (f *Font) templates(size float64, w, h int, baseline float64, phases []float64) ([][]float32, []rune) {
+// templates draws every ASCII character the font has, and with latin the
+// accented letters too, at each sub-pixel offset, as unit vectors for
+// matching. Choosing the font uses ASCII alone: more shapes to match lift a
+// wrong font more than the right one, and Adwaita Mono beat JetBrains Mono.
+func (f *Font) templates(size float64, w, h int, baseline float64, phases []float64, latin bool) ([][]float32, []rune) {
 	var vecs [][]float32
 	var labels []rune
 	z := vector.NewRasterizer(w, h)
 	chars := ascii
-	if len(phases) > 1 {
-		chars = append(ascii[:len(ascii):len(ascii)], latin...)
+	if latin {
+		chars = append(ascii[:len(ascii):len(ascii)], latinLetters...)
 	}
 	for _, ch := range chars {
 		gid, ok := f.Glyphs[ch]

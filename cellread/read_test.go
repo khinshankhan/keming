@@ -5,6 +5,9 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"image/png"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -176,4 +179,103 @@ func TestReadsBoldText(t *testing.T) {
 	if got.Text != want || got.Font != "gomonobold.ttf" {
 		t.Fatalf("read %q in %s, want %q in gomonobold.ttf", got.Text, got.Font, want)
 	}
+}
+
+// wideGlyph paints a stand-in for a Chinese, Japanese or Korean character,
+// a boxed cross like 田, over two cells starting at column col of line, as a
+// terminal lays one out. Cells match drawText's at size 16: 9.6 pixels wide
+// from x 16, with lines 22 pixels apart.
+func wideGlyph(img *image.RGBA, line, col int, c color.Color) {
+	left := 16 + int(float64(col)*9.6) + 2
+	right := 16 + int(float64(col+2)*9.6) - 2
+	baseline := 12 + 16 + line*22
+	top, bottom := baseline-13, baseline+1
+	mid, centre := (top+bottom)/2, (left+right)/2
+	for y := top; y <= bottom; y++ {
+		for x := left; x <= right; x++ {
+			if y <= top+1 || y >= bottom-1 || x <= left+1 || x >= right-1 || y == mid || x == centre {
+				img.Set(x, y, c)
+			}
+		}
+	}
+}
+
+func TestWideGlyphsAreLeftToAnotherReader(t *testing.T) {
+	text := "// " + "    " + "\nx := f(  ) + 1\nreturn x"
+	img := drawText(t, gomono.TTF, text, dark, 16).(*image.RGBA)
+	fg := dark.colors[0]
+	wideGlyph(img, 0, 3, fg)
+	wideGlyph(img, 0, 5, fg)
+	wideGlyph(img, 1, 7, fg)
+
+	got, err := Read(img, goMono(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "// ��\nx := f(�) + 1\nreturn x"
+	if got.Text != want {
+		t.Fatalf("read\n%s\nwant\n%s", got.Text, want)
+	}
+	if len(got.Wide) != 2 {
+		t.Fatalf("got wide runs %+v, want two", got.Wide)
+	}
+	for i, w := range []struct{ line, start, count, x0, x1 int }{
+		{0, 3, 2, 45, 83},
+		{1, 7, 1, 83, 102},
+	} {
+		g := got.Wide[i]
+		if g.Line != w.line || g.Start != w.start || g.Count != w.count {
+			t.Errorf("run %d is line %d from %d, %d wide, want line %d from %d, %d wide", i, g.Line, g.Start, g.Count, w.line, w.start, w.count)
+		}
+		if d := g.Bounds.Min.X - w.x0; d < -2 || d > 2 {
+			t.Errorf("run %d starts at x %d, want about %d", i, g.Bounds.Min.X, w.x0)
+		}
+		if d := g.Bounds.Max.X - w.x1; d < -2 || d > 2 {
+			t.Errorf("run %d ends at x %d, want about %d", i, g.Bounds.Max.X, w.x1)
+		}
+	}
+	if got.Score < 0.95 {
+		t.Errorf("score %.3f: the wide glyphs shouldn't count against the cells read", got.Score)
+	}
+}
+
+func TestKoreanTerminalTextIsMonospace(t *testing.T) {
+	// git commit -m "수정: 로그인 오류" over cat 메모.txt | wc -l, from
+	// Ghostty. Pairs of cells fit Korean, two cells wide, more cleanly than
+	// single ones, so the grid came out at twice the pitch and the text
+	// wasn't monospace.
+	img := fixture(t, "korean-terminal.png")
+	if _, err := Prepare(img); err != nil {
+		t.Fatalf("got %v, want the text found monospace", err)
+	}
+}
+
+func TestVideoCallIsNotMonospace(t *testing.T) {
+	// A mock video call: its grid came out 195 pixels wide, and three words
+	// taken for Chinese or Japanese glyphs left no border crossed.
+	img := fixture(t, "video-call.png")
+	if _, err := Prepare(img); !errors.Is(err, ErrNotMonospace) {
+		t.Fatalf("got %v, want ErrNotMonospace", err)
+	}
+}
+
+// fixture decodes the screenshot name from the folder KEMING_FIXTURES names.
+// Screenshots are kept out of the repository; without the folder, the test
+// is skipped.
+func fixture(t *testing.T, name string) image.Image {
+	t.Helper()
+	dir := os.Getenv("KEMING_FIXTURES")
+	if dir == "" {
+		t.Skip("KEMING_FIXTURES is not set")
+	}
+	f, err := os.Open(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return img
 }

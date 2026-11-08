@@ -11,8 +11,10 @@ package cellread
 import (
 	"errors"
 	"image"
+	"maps"
 	"math"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -31,8 +33,18 @@ var ErrNotMonospace = errors.New("not monospace text")
 // forms and documents, and a real chat screenshot, at least 0.25.
 const maxBorderInk = 0.17
 
+// maxWideScore is the most either cell of a pair crossed by one glyph may
+// match a Latin character for the pair to be read as one glyph two cells
+// wide. The halves of Chinese, Japanese and Korean glyphs in Ghostty matched
+// 0.72 at most, and of a test's stand-in 0.78; letters that touch matched
+// 0.91 and up, such as er, and =8 in a small chat screenshot 0.68 and 0.89.
+const maxWideScore = 0.8
+
 // Result is the text read from an image, and how sure the reader was.
 type Result struct {
+	// Text is what was read. Each Chinese, Japanese or Korean character, two
+	// cells wide in a terminal, is a U+FFFD, for another reader to fill in
+	// from Wide.
 	Text string
 	// Font is the installed font the text was matched against.
 	Font string
@@ -40,7 +52,22 @@ type Result struct {
 	// Text in a font that isn't installed scores lower, but the ranges
 	// overlap, so it isn't a reliable signal on its own.
 	Score float64
+	// Wide are the runs of characters two cells wide that the cell reader
+	// left as U+FFFD, as it reads only Latin letters.
+	Wide []Wide
 }
+
+// Wide is a run of characters two cells wide, such as Chinese, Japanese or
+// Korean, on one line of a Result's text.
+type Wide struct {
+	Line   int // line of the text
+	Start  int // position in the line, in runes, of the first U+FFFD
+	Count  int // characters in the run
+	Bounds image.Rectangle
+}
+
+// unread stands in for a wide character in Result.Text.
+const unread = '\uFFFD'
 
 type page struct {
 	k        ink
@@ -54,6 +81,9 @@ type page struct {
 	where    [][2]int      // row and column of each occupied cell
 	at       map[[2]int]int
 	rowIDs   [][]int // indexes into boxes, per row that has any
+	// wide are the cell pairs, by row and first column, that one glyph two
+	// cells wide may cover, or a ligature.
+	wide map[[2]int]bool
 }
 
 func newPage(img image.Image) (*page, bool) {
@@ -67,8 +97,9 @@ func newPage(img image.Image) (*page, bool) {
 	if !ok {
 		return nil, false
 	}
-	pg := &page{k: k, rows: k.lineGrid(), pitch: pitch, x0: x0, w: int(math.Round(pitch)), at: map[[2]int]int{}}
+	pg := &page{k: k, rows: trimEdgeRows(k.lineGrid()), pitch: pitch, x0: x0, w: int(math.Round(pitch)), at: map[[2]int]int{}}
 	pg.occ = k.occupied(pg.rows, pitch, x0)
+	pg.wide = k.widePairs(pg.rows, pitch, x0)
 	for _, r := range pg.rows {
 		pg.h = max(pg.h, r.b-r.a)
 	}
@@ -277,7 +308,7 @@ func every(ids []int, step int) []int {
 
 // chooseFont runs a quick pass over every font, a careful pass over the best
 // few families, then lets the top three compete by reading the whole page.
-func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, reading, []candidate) {
+func (pg *page) chooseFont(fonts []*Font) (candidate, reading, []candidate) {
 	all := make([]int, len(pg.boxes))
 	for i := range all {
 		all[i] = i
@@ -294,7 +325,7 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	}
 	var quicks []quick
 	for _, f := range fonts {
-		t, _ := f.templates(round2(pg.pitch/f.Advance), pg.w, pg.h, pg.baseline, []float64{0})
+		t, _ := f.templates(round2(pg.pitch/f.Advance), pg.w, pg.h, pg.baseline, []float64{0}, false)
 		// Every other offset first, then the neighbours of the best: a coarse
 		// step alone can skip one font's baseline and land on another's.
 		dy, dx, _ := pg.fitShift(few, t, dys2, dxs2)
@@ -325,17 +356,17 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	// It is searched widely once, then only nearby for each candidate, since
 	// fonts and sizes move glyphs by a pixel or two at most.
 	lead := quicks[0].f
-	t0, _ := lead.templates(round2(pg.pitch/lead.Advance), pg.w, pg.h, pg.baseline, []float64{0})
+	t0, _ := lead.templates(round2(pg.pitch/lead.Advance), pg.w, pg.h, pg.baseline, []float64{0}, false)
 	dyAll, dxAll, _ := pg.fitShift(sample, t0, dys, dxs)
 	near := func(c, lo, hi int) []int { return span1(max(c-lo, -hi), min(c+lo, hi), 1) }
 	var ranked []candidate
 	for _, f := range short {
 		for _, mul := range []float64{1, 0.985, 0.97, 1.015} {
 			size := round2(pg.pitch / f.Advance * mul)
-			t0, _ := f.templates(size, pg.w, pg.h, pg.baseline, []float64{0})
+			t0, _ := f.templates(size, pg.w, pg.h, pg.baseline, []float64{0}, false)
 			fit := candidate{font: f, size: size}
 			fit.dy, fit.dx, fit.score = pg.fitShift(sample, t0, near(dyAll, 3, pg.h), near(dxAll, 2, pg.w))
-			t, _ := pg.templatesFor(f, size)
+			t, _ := pg.templatesFor(f, size, false)
 			s, _ := pg.match(sample, t, []int{fit.dy - 1, fit.dy, fit.dy + 1}, []int{fit.dx})
 			fit.score = mean32(s)
 			ranked = append(ranked, fit)
@@ -344,8 +375,6 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].score > ranked[j].score })
 
 	var best candidate
-	var bestT [][]float32
-	var bestL []rune
 	var bestR reading
 	bestMean := math.Inf(-1)
 	// Finalists come from different families: three weights of one family
@@ -372,20 +401,20 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 		}
 		used[c.font.Family] = true
 		copies[key] = nil
-		t, l := pg.templatesFor(c.font, c.size)
+		t, _ := pg.templatesFor(c.font, c.size, false)
 		rd := pg.readRows(t, c.dy, []int{c.dx - 1, c.dx, c.dx + 1})
 		if m := mean32(rd.scores); m > bestMean {
-			best, bestT, bestL, bestR, bestMean, bestKey = c, t, l, rd, m, key
+			best, bestR, bestMean, bestKey = c, rd, m, key
 		}
 		if len(used) == 4 {
 			break
 		}
 	}
-	return best, bestT, bestL, bestR, copies[bestKey]
+	return best, bestR, copies[bestKey]
 }
 
-func (pg *page) templatesFor(f *Font, size float64) ([][]float32, []rune) {
-	return f.templates(size, pg.w, pg.h, pg.baseline, subPixel)
+func (pg *page) templatesFor(f *Font, size float64, latin bool) ([][]float32, []rune) {
+	return f.templates(size, pg.w, pg.h, pg.baseline, subPixel, latin)
 }
 
 // findOps finds runs of cells better read as one operator shape, which is how
@@ -515,6 +544,98 @@ func Read(img image.Image, fonts []*Font) (Result, error) {
 	return p.Read(fonts)
 }
 
+// wideGlyphs picks the cell pairs that are one glyph two cells wide, by row
+// and first column. A pair crossed by one glyph is one unless it is a
+// ligature or its cells read as Latin letters: in unhinted text, er and f(
+// can touch. A run of them then takes in the pairs either side whose cells
+// both have ink and match nothing well, and whose outer borders no ink
+// crosses, as some glyphs, such as い, don't cross the middle border. Without
+// the borders, a run took ト's right half and the 0 after it as one glyph.
+func (pg *page) wideGlyphs(rd reading, ops map[[2]int]rune) map[[2]int]bool {
+	inOp := func(p [2]int) bool {
+		_, ok := ops[p]
+		return ok
+	}
+	score := func(p [2]int) float32 {
+		if id, ok := pg.at[p]; ok {
+			return rd.scores[id]
+		}
+		return 0
+	}
+	wide := map[[2]int]bool{}
+	for pos := range pg.wide {
+		right := [2]int{pos[0], pos[1] + 1}
+		if !inOp(pos) && !inOp(right) && score(pos) < maxWideScore && score(right) < maxWideScore {
+			wide[pos] = true
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for _, pos := range slices.SortedFunc(maps.Keys(wide), cmpPos) {
+			for _, next := range [][2]int{{pos[0], pos[1] + 2}, {pos[0], pos[1] - 2}} {
+				right := [2]int{next[0], next[1] + 1}
+				_, l := pg.at[next]
+				_, r := pg.at[right]
+				switch {
+				case next[1] < 0 || wide[next] || wide[[2]int{next[0], next[1] - 1}] || wide[right]:
+				case !l || !r, inOp(next), inOp(right):
+				case pg.k.crossed(pg.rows[next[0]], pg.x0, pg.pitch, next[1]) > 1, pg.k.crossed(pg.rows[next[0]], pg.x0, pg.pitch, next[1]+2) > 1:
+				case score(next) < maxWideScore && score(right) < maxWideScore:
+					wide[next] = true
+					grew = true
+				}
+			}
+		}
+	}
+	return wide
+}
+
+// cmpPos orders cells by row, then column.
+func cmpPos(a, b [2]int) int {
+	if a[0] != b[0] {
+		return a[0] - b[0]
+	}
+	return a[1] - b[1]
+}
+
+// onlyAtEdge reports whether the ink in cell r, c touches only the edge of
+// its line that faces line from.
+func (pg *page) onlyAtEdge(r, c, from int) bool {
+	strip := max(2, (pg.rows[r].b-pg.rows[r].a)/8)
+	lo, hi := pg.rows[r].b-strip, pg.rows[r].b
+	if from < r {
+		lo, hi = pg.rows[r].a, pg.rows[r].a+strip
+	}
+	for y := pg.rows[r].a; y < pg.rows[r].b; y++ {
+		for x := max(pg.cellX(c), 0); x < min(pg.cellX(c+1), pg.k.w); x++ {
+			if pg.k.at(x, y) > inkThreshold && (y < lo || y >= hi) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// trimEdgeRows drops a first or last row less than half as tall as the
+// tallest: the last pixels of a glyph from a line the selection cut, such as
+// the foot of a |, which read as a stray mark.
+func trimEdgeRows(rows []span) []span {
+	tall := 0
+	for _, r := range rows {
+		tall = max(tall, r.b-r.a)
+	}
+	for len(rows) > 1 && 2*(rows[0].b-rows[0].a) < tall {
+		rows = rows[1:]
+	}
+	for len(rows) > 1 && 2*(rows[len(rows)-1].b-rows[len(rows)-1].a) < tall {
+		rows = rows[:len(rows)-1]
+	}
+	return rows
+}
+
+// cellX is where column c starts.
+func (pg *page) cellX(c int) int { return int(math.Round(pg.x0 + float64(c)*pg.pitch)) }
+
 // Page is an image whose character grid has been found.
 type Page struct{ pg *page }
 
@@ -526,7 +647,7 @@ func Prepare(img image.Image) (*Page, error) {
 	if !ok {
 		return nil, ErrNoText
 	}
-	if pg.k.gridFit(pg.rows, pg.pitch, pg.x0) > maxBorderInk {
+	if pg.k.gridFit(pg.rows, pg.pitch, pg.x0, pg.wide) > maxBorderInk {
 		return nil, ErrNotMonospace
 	}
 	return &Page{pg}, nil
@@ -538,7 +659,10 @@ func (p *Page) Read(fonts []*Font) (Result, error) {
 		return Result{}, errNoFonts
 	}
 	pg := p.pg
-	c, t, labels, rd, copies := pg.chooseFont(fonts)
+	c, rd, copies := pg.chooseFont(fonts)
+	// The font is chosen on ASCII; the text is read with accented letters.
+	t, labels := pg.templatesFor(c.font, c.size, true)
+	rd = pg.readRows(t, c.dy, []int{c.dx - 1, c.dx, c.dx + 1})
 	ops := pg.findOps(c, rd)
 	// A copy of the font can only differ in its ligatures, so it wins only by
 	// finding more of them on screen.
@@ -547,8 +671,25 @@ func (p *Page) Read(fonts []*Font) (Result, error) {
 			c, ops = alt, o
 		}
 	}
+	wide := pg.wideGlyphs(rd, ops)
+	skip := maps.Clone(ops)
+	for pos := range wide {
+		skip[pos], skip[[2]int{pos[0], pos[1] + 1}] = unread, unread
+	}
+	// The tops and bottoms of wide glyphs, drawn taller than Latin text, can
+	// reach into the next line; there they are nothing.
+	for pos := range wide {
+		for _, r := range []int{pos[0] - 1, pos[0] + 1} {
+			for _, c := range []int{pos[1], pos[1] + 1} {
+				if r >= 0 && r < len(pg.occ) && c < len(pg.occ[r]) && pg.occ[r][c] && pg.onlyAtEdge(r, c, pos[0]) {
+					pg.occ[r][c] = false
+					skip[[2]int{r, c}] = unread
+				}
+			}
+		}
+	}
 	dxr := []int{c.dx - 1, c.dx, c.dx + 1}
-	t2, labels2 := pg.learn(t, labels, rd, ops, dxr)
+	t2, labels2 := pg.learn(t, labels, rd, skip, dxr)
 	if len(t2) > len(t) {
 		rd = pg.readRows(t2, c.dy, dxr)
 		labels = labels2
@@ -570,6 +711,7 @@ func (p *Page) Read(fonts []*Font) (Result, error) {
 		}
 	}
 	var lines []string
+	var runs []Wide
 	for r, row := range pg.occ {
 		last := -1
 		for c, on := range row {
@@ -577,21 +719,43 @@ func (p *Page) Read(fonts []*Font) (Result, error) {
 				last = c
 			}
 		}
-		var b strings.Builder
+		var b []rune
 		for c := base; c <= last; c++ {
-			if row[c] {
-				b.WriteRune(chars[[2]int{r, c}])
-			} else {
-				b.WriteByte(' ')
+			switch {
+			case wide[[2]int{r, c}]:
+				cell := image.Rect(pg.cellX(c), pg.rows[r].a, pg.cellX(c+2), pg.rows[r].b)
+				if n := len(runs) - 1; n >= 0 && runs[n].Line == len(lines) && runs[n].Start+runs[n].Count == len(b) {
+					runs[n].Count++
+					runs[n].Bounds = runs[n].Bounds.Union(cell)
+				} else {
+					runs = append(runs, Wide{Line: len(lines), Start: len(b), Count: 1, Bounds: cell})
+				}
+				b = append(b, unread)
+				c++
+			case row[c]:
+				b = append(b, chars[[2]int{r, c}])
+			default:
+				b = append(b, ' ')
 			}
 		}
-		lines = append(lines, b.String())
+		lines = append(lines, string(b))
 	}
+	lead := 0
 	for len(lines) > 0 && lines[0] == "" {
 		lines = lines[1:]
+		lead++
 	}
 	for len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	return Result{Text: strings.Join(lines, "\n"), Font: c.font.Name, Score: mean32(rd.scores)}, nil
+	for i := range runs {
+		runs[i].Line -= lead
+	}
+	var read []float32
+	for id, s := range rd.scores {
+		if skip[pg.where[id]] != unread {
+			read = append(read, s)
+		}
+	}
+	return Result{Text: strings.Join(lines, "\n"), Font: c.font.Name, Score: mean32(read), Wide: runs}, nil
 }
