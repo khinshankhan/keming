@@ -97,6 +97,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}()
 	}
 	var read func(image.Image) (string, error)
+	// bands reads the runs of wide characters the cell reader leaves, with
+	// the same helper, as only one of the two runs.
+	var bands func(image.Image, []image.Rectangle) ([]string, error)
+	// eachRun reads a run PP-OCRv6 didn't, or every run without it.
+	eachRun := readKorean
 	switch name {
 	case "PP-OCRv6":
 		r, err := rapid.Start(binary)
@@ -104,6 +109,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			return err
 		}
 		defer r.Close()
+		bands = r.ReadBands
 		read = func(img image.Image) (string, error) {
 			big := upscale(img, upscaleBy)
 			text, err := r.Read(big)
@@ -125,6 +131,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		read = func(img image.Image) (string, error) {
 			return tesseract.Recognize(binary, *lang, upscale(img, upscaleBy))
 		}
+		if *lang != "eng" {
+			eachRun = func(img image.Image) (string, error) {
+				return tesseract.Recognize(binary, *lang, img)
+			}
+		}
 	}
 
 	img, ok, err := readImage(fs.Arg(0), stdin)
@@ -136,22 +147,38 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	// only one runs: the cell reader on monospace text, falling back to the
 	// other reader if it is unsure, and the other reader on anything else.
 	var text, why string
+	var c cellReading
 	switch {
 	case read == nil:
-		c := readCells(img, fonts)
+		c = readCells(img, fonts)
 		text, err = c.res.Text, c.err
 		why = fmt.Sprintf("cell reader (%s, match %.2f), as asked", c.res.Font, c.res.Score)
 	case !useCells:
 		text, err = read(img)
 		why = name + ", as asked"
 	default:
-		c := readCells(img, fonts)
-		if c.err == nil && c.res.Score >= monoConfident {
+		c = readCells(img, fonts)
+		if trusted(c) {
 			text, why, err = choose(c, textReading{})
 			break
 		}
 		t, terr := read(img)
 		text, why, err = choose(c, textReading{name, t, terr})
+	}
+	if err == nil && len(c.res.Wide) > 0 && text == c.res.Text {
+		var left int
+		text, left = fillWide(img, c.res, bands, eachRun)
+		if bands != nil {
+			why += ", wide characters by PP-OCRv6"
+		} else {
+			why += ", wide characters by tesseract"
+		}
+		if left > 0 {
+			why += fmt.Sprintf(", %d left unread", left)
+			if bands == nil {
+				why += " without " + rapid.Binary
+			}
+		}
 	}
 	if *verbose {
 		fmt.Fprintln(stderr, "keming: read by", why)
@@ -260,14 +287,103 @@ type textReading struct {
 // monospace text in a font it knows, such as code, and the other reader's
 // otherwise. It says which it used, for -v.
 func choose(cells cellReading, other textReading) (text, why string, err error) {
-	if cells.err == nil && cells.res.Score >= monoConfident {
+	if trusted(cells) {
 		return cells.res.Text, fmt.Sprintf("cell reader (%s, match %.2f)", cells.res.Font, cells.res.Score), nil
 	}
 	why = fmt.Sprintf("%s (cell reader: %v)", other.by, cells.err)
-	if cells.err == nil {
+	switch {
+	case cells.err == nil && !mostlyLatin(cells.res):
+		why = fmt.Sprintf("%s (cell reader: mostly wide characters)", other.by)
+	case cells.err == nil:
 		why = fmt.Sprintf("%s (cell reader match %.2f)", other.by, cells.res.Score)
 	}
 	return other.text, why, other.err
+}
+
+// trusted reports whether the cell reader's text should be used: it is
+// confident of the cells it read, and they are most of the text.
+func trusted(c cellReading) bool {
+	return c.err == nil && c.res.Score >= monoConfident && mostlyLatin(c.res)
+}
+
+// mostlyLatin reports whether the cell reader read more characters itself
+// than it left as wide. Text that is mostly Chinese or Japanese, such as a
+// title, the other reader reads better whole.
+func mostlyLatin(res cellread.Result) bool {
+	wide, latin := 0, 0
+	for _, w := range res.Wide {
+		wide += w.Count
+	}
+	for _, r := range res.Text {
+		if r != ' ' && r != '\n' && r != '\uFFFD' {
+			latin++
+		}
+	}
+	return latin >= wide
+}
+
+// fillWide puts text in place of the runs of wide characters the cell reader
+// left in res, reading them with bands, all in one image, and then any
+// still empty with eachRun, given each run enlarged and with a margin. It
+// returns the text and how many characters are still unread. bands may be
+// nil, without PP-OCRv6 or when another language is asked for.
+func fillWide(img image.Image, res cellread.Result, bands func(image.Image, []image.Rectangle) ([]string, error), eachRun func(image.Image) (string, error)) (string, int) {
+	texts := make([]string, len(res.Wide))
+	if bands != nil {
+		stack, rects := stackRuns(img, res.Wide)
+		if got, err := bands(stack, rects); err == nil && len(got) == len(texts) {
+			texts = got
+		}
+	}
+	lines := strings.Split(res.Text, "\n")
+	left := 0
+	for i := len(res.Wide) - 1; i >= 0; i-- {
+		w := res.Wide[i]
+		t := strings.TrimSpace(texts[i])
+		if t == "" {
+			if k, err := eachRun(padded(upscale(crop(img, w.Bounds), upscaleBy), margin)); err == nil {
+				t = strings.TrimSpace(k)
+			}
+		}
+		if t == "" {
+			left += w.Count
+			continue
+		}
+		line := []rune(lines[w.Line])
+		lines[w.Line] = string(line[:w.Start]) + t + string(line[w.Start+w.Count:])
+	}
+	return strings.Join(lines, "\n"), left
+}
+
+// stackRuns draws the runs, cut from img, one above another with space
+// between, enlarged and with a margin, and returns the band of the result
+// each run is in.
+func stackRuns(img image.Image, runs []cellread.Wide) (*image.RGBA, []image.Rectangle) {
+	const pad = 8
+	w, h := 0, 0
+	for _, r := range runs {
+		w = max(w, r.Bounds.Dx())
+		h = max(h, r.Bounds.Dy())
+	}
+	gap := h
+	stack := image.NewRGBA(image.Rect(0, 0, w+2*pad, len(runs)*(h+gap)+2*pad))
+	draw.Draw(stack, stack.Bounds(), image.NewUniform(edgeColour(img)), image.Point{}, draw.Src)
+	var rects []image.Rectangle
+	for i, r := range runs {
+		y := pad + gap/2 + i*(h+gap)
+		draw.Draw(stack, image.Rect(pad, y, pad+r.Bounds.Dx(), y+r.Bounds.Dy()), img, r.Bounds.Min.Add(img.Bounds().Min), draw.Src)
+		band := image.Rect(0, y-gap/2, stack.Bounds().Dx(), y+h+gap/2)
+		rects = append(rects, image.Rectangle{band.Min.Mul(upscaleBy), band.Max.Mul(upscaleBy)}.Add(image.Pt(margin, margin)))
+	}
+	big := upscale(stack, upscaleBy)
+	return padded(big, margin), rects
+}
+
+// crop returns the part r of img, r being relative to img's corner.
+func crop(img image.Image, r image.Rectangle) *image.RGBA {
+	out := image.NewRGBA(image.Rect(0, 0, r.Dx(), r.Dy()))
+	draw.Draw(out, out.Bounds(), img, r.Min.Add(img.Bounds().Min), draw.Src)
+	return out
 }
 
 // padded returns img with a margin of its most common edge colour around

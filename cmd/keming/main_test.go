@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/khinshankhan/keming/cellread"
+	"golang.org/x/image/draw"
 )
 
 func TestChoose(t *testing.T) {
@@ -37,6 +38,9 @@ func TestChoose(t *testing.T) {
 		{"confident cell reader covers a failure", cells("ok", 0.97), other("", fail), "ok", nil},
 		{"an unsure guess is no answer", cells("x#q", 0.5), other("", noText), "", noText},
 		{"the other reader's error comes through", cells("x#q", 0.5), other("", fail), "", fail},
+		// A title in Chinese or Japanese is all wide characters, which the
+		// other reader reads better whole.
+		{"mostly wide characters lose", cellReading{res: cellread.Result{Text: "\uFFFD\uFFFD\uFFFD0", Score: 0.99, Wide: []cellread.Wide{{Count: 3}}}}, other("名探偵0", nil), "名探偵0", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -301,5 +305,51 @@ func TestPaddedUsesTheEdgeColour(t *testing.T) {
 	}
 	if got.RGBAAt(12, 5) != white {
 		t.Errorf("the text pixel moved: %v at 12,5", got.RGBAAt(12, 5))
+	}
+}
+
+func TestFillWide(t *testing.T) {
+	// No tesseract, so a run PP-OCRv6 can't read stays unread.
+	t.Setenv("PATH", t.TempDir())
+	red := color.RGBA{255, 0, 0, 255}
+	green := color.RGBA{0, 255, 0, 255}
+	blue := color.RGBA{0, 0, 255, 255}
+	img := image.NewRGBA(image.Rect(0, 0, 200, 60))
+	draw.Draw(img, img.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	runs := []cellread.Wide{
+		{Line: 0, Start: 3, Count: 2, Bounds: image.Rect(30, 0, 70, 20)},
+		{Line: 0, Start: 8, Count: 1, Bounds: image.Rect(110, 0, 130, 20)},
+		{Line: 2, Start: 0, Count: 1, Bounds: image.Rect(0, 40, 20, 60)},
+	}
+	for i, c := range []color.Color{red, green, blue} {
+		draw.Draw(img, runs[i].Bounds.Inset(4), image.NewUniform(c), image.Point{}, draw.Src)
+	}
+	res := cellread.Result{Text: "// \uFFFD\uFFFD = \uFFFD;\nx\n\uFFFD", Wide: runs}
+	// Reads each band as the colour it finds there; blue can't be read.
+	names := map[color.RGBA]string{red: "世界", green: "注"}
+	bands := func(stack image.Image, rects []image.Rectangle) ([]string, error) {
+		out := make([]string, len(rects))
+		for i, r := range rects {
+			found := map[string]bool{}
+			for y := r.Min.Y; y < r.Max.Y; y++ {
+				for x := r.Min.X; x < r.Max.X; x++ {
+					c := color.RGBAModel.Convert(stack.At(x, y)).(color.RGBA)
+					if n, ok := names[c]; ok && !found[n] {
+						found[n] = true
+						out[i] += n
+					}
+				}
+			}
+		}
+		return out, nil
+	}
+
+	got, left := fillWide(img, res, bands, readKorean)
+
+	if want := "// 世界 = 注;\nx\n\uFFFD"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if left != 1 {
+		t.Fatalf("%d left unread, want 1", left)
 	}
 }
