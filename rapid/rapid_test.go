@@ -7,6 +7,7 @@ import (
 	"image"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -128,6 +129,26 @@ func TestReadWithinDropsBoxesOutside(t *testing.T) {
 				t.Fatalf("got %q, %v, want %q", got, err, tt.want)
 			}
 		})
+	}
+}
+
+func TestReadBands(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 200, 120))
+	bands := []image.Rectangle{image.Rect(0, 0, 200, 40), image.Rect(0, 40, 200, 80), image.Rect(0, 80, 200, 120)}
+	// Two boxes in the first band, out of order, none in the second.
+	boxes := `[{"text": "界", "box": [[60,5],[90,5],[90,35],[60,35]]},` +
+		`{"text": "世", "box": [[10,5],[40,5],[40,35],[10,35]]},` +
+		`{"text": "注释", "box": [[10,85],[70,85],[70,115],[10,115]]}]`
+	r, err := Start(fake(t, "cat >/dev/null; printf '%s' '"+boxes+"'"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.ReadBands(img, bands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"世界", "", "注释"}; !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

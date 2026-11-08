@@ -73,23 +73,43 @@ func (r *Reader) ReadWithin(img image.Image, within image.Rectangle) (string, er
 	})
 }
 
+// ReadBands reads img, made of separate bands of text, and returns the text
+// found in each band, by where each box's centre falls, left to right with
+// nothing between. It is for a few short runs of text, such as the Chinese,
+// Japanese or Korean in a terminal, stacked into one image to be read in one
+// go.
+func (r *Reader) ReadBands(img image.Image, bands []image.Rectangle) ([]string, error) {
+	boxes, err := r.boxes(img)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortStableFunc(boxes, func(a, b box) int {
+		_, _, la := extent(a)
+		_, _, lb := extent(b)
+		return cmpFloat(la, lb)
+	})
+	out := make([]string, len(bands))
+	for _, b := range boxes {
+		var x, y float64
+		for _, p := range b.Box {
+			x, y = x+p[0]/float64(len(b.Box)), y+p[1]/float64(len(b.Box))
+		}
+		for i, band := range bands {
+			if image.Pt(int(x), int(y)).In(band) {
+				out[i] += b.Text
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // read sends img to the helper and puts the boxes it finds, those keep
 // accepts, into lines.
 func (r *Reader) read(img image.Image, keep func(box) bool) (string, error) {
-	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
-	err := encoder.Encode(r.stdin, img)
-	if cerr := r.stdin.Close(); err == nil {
-		err = cerr
-	}
-	if werr := r.cmd.Wait(); werr != nil {
-		return "", fmt.Errorf("%s: %w: %s", Binary, werr, lastLine(r.stderr.String()))
-	}
+	boxes, err := r.boxes(img)
 	if err != nil {
 		return "", err
-	}
-	var boxes []box
-	if err := json.Unmarshal(r.out.Bytes(), &boxes); err != nil {
-		return "", fmt.Errorf("%s: %w", Binary, err)
 	}
 	boxes = slices.DeleteFunc(boxes, func(b box) bool { return !keep(b) })
 	text := assembleLines(boxes)
@@ -97,6 +117,26 @@ func (r *Reader) read(img image.Image, keep func(box) bool) (string, error) {
 		return "", ErrNoText
 	}
 	return text, nil
+}
+
+// boxes sends img to the helper and returns the boxes it finds.
+func (r *Reader) boxes(img image.Image) ([]box, error) {
+	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+	err := encoder.Encode(r.stdin, img)
+	if cerr := r.stdin.Close(); err == nil {
+		err = cerr
+	}
+	if werr := r.cmd.Wait(); werr != nil {
+		return nil, fmt.Errorf("%s: %w: %s", Binary, werr, lastLine(r.stderr.String()))
+	}
+	if err != nil {
+		return nil, err
+	}
+	var boxes []box
+	if err := json.Unmarshal(r.out.Bytes(), &boxes); err != nil {
+		return nil, fmt.Errorf("%s: %w", Binary, err)
+	}
+	return boxes, nil
 }
 
 // Close stops a helper that won't be given an image.
