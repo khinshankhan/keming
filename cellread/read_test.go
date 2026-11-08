@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/gofont/gomono"
+	"golang.org/x/image/font/gofont/gomonobold"
 	"golang.org/x/image/font/gofont/goregular"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
@@ -40,7 +41,12 @@ var (
 // text drawing rather than this package's glyph code.
 func screenshot(t *testing.T, text string, th theme, size float64) image.Image {
 	t.Helper()
-	parsed, err := opentype.Parse(gomono.TTF)
+	return drawText(t, gomono.TTF, text, th, size)
+}
+
+func drawText(t *testing.T, ttf []byte, text string, th theme, size float64) image.Image {
+	t.Helper()
+	parsed, err := opentype.Parse(ttf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +115,16 @@ func TestBlankImageIsNoText(t *testing.T) {
 	}
 }
 
+func TestThinRuleIsNoText(t *testing.T) {
+	// A selection of a divider line: too thin to hold a glyph.
+	img := image.NewRGBA(image.Rect(0, 0, 200, 40))
+	draw.Draw(img, img.Bounds(), image.NewUniform(dark.bg), image.Point{}, draw.Src)
+	draw.Draw(img, image.Rect(10, 19, 190, 21), image.NewUniform(dark.colors[0]), image.Point{}, draw.Src)
+	if _, err := Read(img, goMono(t)); !errors.Is(err, ErrNoText) {
+		t.Fatalf("err %v, want ErrNoText", err)
+	}
+}
+
 func TestNoFontsIsAnError(t *testing.T) {
 	img := screenshot(t, "x", dark, 16)
 	if _, err := Read(img, nil); !errors.Is(err, errNoFonts) {
@@ -120,5 +136,42 @@ func TestLoadFontRejectsProportional(t *testing.T) {
 	// Go Regular is proportional: i and M differ in width.
 	if _, err := LoadFont("goregular.ttf", goregular.TTF); err == nil {
 		t.Fatal("loaded a proportional font as monospace")
+	}
+}
+
+func TestProportionalTextIsNotMonospace(t *testing.T) {
+	img := drawText(t, goregular.TTF, "ebb4ca35-9058-4234-b301-83e86314f4cd\nWill you be around on Thursday?", dark, 16)
+	if res, err := Read(img, goMono(t)); !errors.Is(err, ErrNotMonospace) {
+		t.Fatalf("read %q, err %v, want ErrNotMonospace", res.Text, err)
+	}
+}
+
+func TestClippedNeighbourLinesAreIgnored(t *testing.T) {
+	// A selection around one line catches the bottom of the line above and
+	// the top of the line below. At size 16 baselines fall at 28, 50 and 72.
+	img := screenshot(t, "gyp jog quay\nif err != nil {\nHELLO WORLD", dark, 16)
+	area := img.(*image.RGBA).SubImage(image.Rect(0, 29, img.Bounds().Dx(), 63))
+	got, err := Read(area, goMono(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "if err != nil {"; got.Text != want {
+		t.Fatalf("read %q, want %q", got.Text, want)
+	}
+}
+
+func TestReadsBoldText(t *testing.T) {
+	bold, err := LoadFont("gomonobold.ttf", gomonobold.TTF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "drag over it, print it\nl1 O0 = {quit}"
+	img := drawText(t, gomonobold.TTF, want, dark, 16)
+	got, err := Read(img, append(goMono(t), bold))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != want || got.Font != "gomonobold.ttf" {
+		t.Fatalf("read %q in %s, want %q in gomonobold.ttf", got.Text, got.Font, want)
 	}
 }

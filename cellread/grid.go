@@ -106,6 +106,28 @@ func (k ink) bands() []span {
 	return out
 }
 
+// eraseSlivers blanks bands at the top or bottom edge that are much shorter
+// than the tallest: the cut-off bottoms and tops of the lines either side of
+// a selection. They can't be read, and left in they make one line of text
+// look like several, or put ink in the blank cells beside them.
+func (k ink) eraseSlivers() {
+	b := k.bands()
+	tallest := 0
+	for _, s := range b {
+		tallest = max(tallest, s.b-s.a)
+	}
+	thin := func(s span) bool { return (s.b-s.a)*2 < tallest }
+	erase := func(s span) { clear(k.v[s.a*k.w : s.b*k.w]) }
+	for len(b) > 1 && b[0].a == 0 && thin(b[0]) {
+		erase(b[0])
+		b = b[1:]
+	}
+	for len(b) > 1 && b[len(b)-1].b == k.h && thin(b[len(b)-1]) {
+		erase(b[len(b)-1])
+		b = b[:len(b)-1]
+	}
+}
+
 func medianHeight(s []span) float64 {
 	hs := make([]float64, len(s))
 	for i, v := range s {
@@ -308,7 +330,7 @@ func (k ink) cellPitch(bands []span) (pitch, x0 float64, ok bool) {
 			}
 		}
 	}
-	return pitch, x0, true
+	return pitch, x0, pitch > 0
 }
 
 // occupied reports, per row, which cells hold a glyph. Only the middle of a
@@ -334,4 +356,44 @@ func (k ink) occupied(rows []span, pitch, x0 float64) [][]bool {
 		}
 	}
 	return out
+}
+
+// gridFit is how much ink the cell borders cross, relative to an average
+// column of the text: near 0 for monospace text, which keeps to its cells,
+// and well above for proportional text, whose glyphs fall anywhere.
+func (k ink) gridFit(rows []span, pitch, x0 float64) float64 {
+	var border, all float64
+	var nb, na int
+	for _, s := range rows {
+		first, last := k.w, -1
+		col := make([]float64, k.w)
+		for y := s.a; y < s.b; y++ {
+			for x := 0; x < k.w; x++ {
+				if k.at(x, y) > inkThreshold {
+					col[x]++
+					first, last = min(first, x), max(last, x)
+				}
+			}
+		}
+		if last < 0 {
+			continue
+		}
+		for x := first; x <= last; x++ {
+			all += col[x]
+			na++
+		}
+		c0 := int(math.Ceil((float64(first) - x0) / pitch))
+		for c := c0; ; c++ {
+			x := int(math.Round(x0 + float64(c)*pitch))
+			if x > last {
+				break
+			}
+			border += col[x]
+			nb++
+		}
+	}
+	if nb == 0 || all == 0 {
+		return 1
+	}
+	return (border / float64(nb)) / (all / float64(na))
 }

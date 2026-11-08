@@ -46,7 +46,7 @@ func fontDirs() []string {
 	return dirs
 }
 
-// InstalledFonts finds the upright, roughly regular weight monospace fonts
+// InstalledFonts finds the upright monospace fonts, regular to bold,
 // installed on this machine. Text drawn on this screen used one of them, so
 // they are the candidates for reading it back. Nothing is downloaded.
 func InstalledFonts() ([]*Font, error) {
@@ -118,7 +118,7 @@ var familySuffix = regexp.MustCompile(`(nerdfontmono|nerdfontpropo|nerdfont|nfm|
 
 func newFont(name string, face *font.Face) *Font {
 	desc := face.Describe()
-	if desc.Aspect.Style != font.StyleNormal || desc.Aspect.Weight < 350 || desc.Aspect.Weight > 650 {
+	if desc.Aspect.Style != font.StyleNormal || desc.Aspect.Weight < 350 || desc.Aspect.Weight > 700 {
 		return nil
 	}
 	m, okM := face.NominalGlyph('M')

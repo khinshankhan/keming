@@ -3,7 +3,7 @@
 // it finds the character grid in the pixels, works out which installed font
 // drew the text, and matches each cell against that font's own glyphs.
 //
-// Experimental. It reads only printable ASCII in upright, regular weight
+// Experimental. It reads only printable ASCII in upright, regular to bold
 // monospace fonts installed on this machine, and assumes sharp screen pixels,
 // not video or scans.
 package cellread
@@ -20,6 +20,16 @@ import (
 
 // ErrNoText means the image holds nothing that looks like text.
 var ErrNoText = errors.New("no text found")
+
+// ErrNotMonospace means the text doesn't keep to a grid of equal cells, as
+// proportional text such as most web pages, chat and documents doesn't.
+var ErrNotMonospace = errors.New("not monospace text")
+
+// maxBorderInk is how much ink the cell borders may cross, relative to an
+// average column of the text, for it to count as monospace. Code screenshots
+// in four fonts measured at most 0.10, and mock web pages, chat, video calls,
+// forms and documents, and a real chat screenshot, at least 0.25.
+const maxBorderInk = 0.17
 
 // Result is the text read from an image, and how sure the reader was.
 type Result struct {
@@ -48,6 +58,7 @@ type page struct {
 
 func newPage(img image.Image) (*page, bool) {
 	k := newInk(img)
+	k.eraseSlivers()
 	bands := k.bands()
 	if len(bands) == 0 {
 		return nil, false
@@ -266,7 +277,7 @@ func every(ids []int, step int) []int {
 
 // chooseFont runs a quick pass over every font, a careful pass over the best
 // few families, then lets the top three compete by reading the whole page.
-func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, reading) {
+func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, reading, []candidate) {
 	all := make([]int, len(pg.boxes))
 	for i := range all {
 		all[i] = i
@@ -339,22 +350,38 @@ func (pg *page) chooseFont(fonts []*Font) (candidate, [][]float32, []rune, readi
 	bestMean := math.Inf(-1)
 	// Finalists come from different families: three weights of one family
 	// would otherwise fill every place and shut the real font out.
+	// Some fonts are another under a new name, such as DejaVu Sans Mono and
+	// Bitstream Vera Sans Mono: identical glyphs score the same to within
+	// float rounding, so a repeated score and size is a copy and would waste a
+	// place. Copies are kept aside instead, since they can differ in
+	// ligatures alone, as JetBrains Mono and JetBrains Mono NL do.
 	used := map[string]bool{}
+	copies := map[[2]float64][]candidate{}
+	var bestKey [2]float64
 	for _, c := range ranked {
+		key := [2]float64{math.Round(c.score * 1e6), c.size}
+		if _, seen := copies[key]; seen {
+			if !used[c.font.family] {
+				used[c.font.family] = true
+				copies[key] = append(copies[key], c)
+			}
+			continue
+		}
 		if used[c.font.family] {
 			continue
 		}
 		used[c.font.family] = true
+		copies[key] = nil
 		t, l := pg.templatesFor(c.font, c.size)
 		rd := pg.readRows(t, c.dy, []int{c.dx - 1, c.dx, c.dx + 1})
 		if m := mean32(rd.scores); m > bestMean {
-			best, bestT, bestL, bestR, bestMean = c, t, l, rd, m
+			best, bestT, bestL, bestR, bestMean, bestKey = c, t, l, rd, m, key
 		}
 		if len(used) == 4 {
 			break
 		}
 	}
-	return best, bestT, bestL, bestR
+	return best, bestT, bestL, bestR, copies[bestKey]
 }
 
 func (pg *page) templatesFor(f *Font, size float64) ([][]float32, []rune) {
@@ -485,8 +512,20 @@ func Read(img image.Image, fonts []*Font) (Result, error) {
 	if !ok {
 		return Result{}, ErrNoText
 	}
-	c, t, labels, rd := pg.chooseFont(fonts)
+	// Checked before matching any font, which on a large page of proportional
+	// text would take minutes to find nothing.
+	if pg.k.gridFit(pg.rows, pg.pitch, pg.x0) > maxBorderInk {
+		return Result{}, ErrNotMonospace
+	}
+	c, t, labels, rd, copies := pg.chooseFont(fonts)
 	ops := pg.findOps(c, rd)
+	// A copy of the font can only differ in its ligatures, so it wins only by
+	// finding more of them on screen.
+	for _, alt := range copies {
+		if o := pg.findOps(alt, rd); len(o) > len(ops) {
+			c, ops = alt, o
+		}
+	}
 	dxr := []int{c.dx - 1, c.dx, c.dx + 1}
 	t2, labels2 := pg.learn(t, labels, rd, ops, dxr)
 	if len(t2) > len(t) {
