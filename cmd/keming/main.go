@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"unicode"
 
 	"github.com/khinshankhan/keming/cellread"
 	"github.com/khinshankhan/keming/rapid"
@@ -114,7 +115,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 				return "", err
 			}
 			defer again.Close()
-			return again.ReadWithin(padded(big, margin), big.Bounds().Add(image.Pt(margin, margin)))
+			text, err = again.ReadWithin(padded(big, margin), big.Bounds().Add(image.Pt(margin, margin)))
+			if !errors.Is(err, rapid.ErrNoText) {
+				return text, err
+			}
+			return readKorean(big)
 		}
 	case "tesseract":
 		read = func(img image.Image) (string, error) {
@@ -314,6 +319,32 @@ func rgbaLess(a, b color.RGBA) bool {
 		return a.B < b.B
 	}
 	return a.A < b.A
+}
+
+// readKorean reads img with tesseract's Korean model, for when PP-OCRv6,
+// whose model reads Chinese, Japanese and English but not Hangul, found
+// nothing. The text counts only if it has Hangul in it; tesseract makes
+// something of any picture.
+func readKorean(img image.Image) (string, error) {
+	binary, err := exec.LookPath(tesseract.Binary)
+	if err != nil {
+		return "", rapid.ErrNoText
+	}
+	text, err := tesseract.Recognize(binary, "kor", img)
+	if err != nil || !hasHangul(text) {
+		return "", rapid.ErrNoText
+	}
+	return text, nil
+}
+
+// hasHangul reports whether s has a Korean letter in it.
+func hasHangul(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Hangul, r) {
+			return true
+		}
+	}
+	return false
 }
 
 // upscale returns img enlarged by a whole factor. A smooth filter matters:

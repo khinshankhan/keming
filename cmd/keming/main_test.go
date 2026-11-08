@@ -179,6 +179,52 @@ fi
 	}
 }
 
+func TestKoreanFallsBackToTesseract(t *testing.T) {
+	tests := []struct {
+		name, tesseractSays, want, wantErr string
+	}{
+		{"Korean is kept", "권왕환생", "권왕환생\n", ""},
+		// A picture with no text should say so, not print what tesseract
+		// made of it.
+		{"anything else is no text", "ZEA", "", "no text found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fakes := map[string]string{
+				// PP-OCRv6's model has no Hangul, so it finds nothing.
+				"keming-rapidocr": "#!/bin/sh\ncat > /dev/null\necho '[]'\n",
+				"tesseract":       "#!/bin/sh\necho \"$@\" > " + filepath.Join(dir, "args") + "\ncat > /dev/null\nprintf '" + tt.tesseractSays + "\\n\\f'\n",
+			}
+			for name, script := range fakes {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			var out, errOut bytes.Buffer
+			err := run([]string{"-engine", "rapid"}, pngOf(t), &out, &errOut)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("got %v, want %q", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if out.String() != tt.want {
+				t.Fatalf("printed %q, want %q", out.String(), tt.want)
+			}
+			args, err := os.ReadFile(filepath.Join(dir, "args"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(args), "-l kor") {
+				t.Fatalf("tesseract ran with %q, want -l kor", args)
+			}
+		})
+	}
+}
+
 func TestEmptyStdinIsQuiet(t *testing.T) {
 	// A caller that started keming early sends nothing when the user cancels.
 	t.Setenv("PATH", t.TempDir())
