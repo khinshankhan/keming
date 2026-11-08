@@ -114,7 +114,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 				return "", err
 			}
 			defer again.Close()
-			return again.Read(padded(big, margin))
+			return again.ReadWithin(padded(big, margin), big.Bounds().Add(image.Pt(margin, margin)))
 		}
 	case "tesseract":
 		read = func(img image.Image) (string, error) {

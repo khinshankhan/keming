@@ -142,7 +142,7 @@ func TestRetryWithAMarginWhenPPOCRFindsNothing(t *testing.T) {
 cd ` + dir + `
 if [ -e sent-1.png ]; then
 	cat > sent-2.png
-	echo '[{"text": "名探偵コナン", "box": [[0,0],[10,0],[10,5],[0,5]]}]'
+	echo '[{"text": "名探偵コナン", "box": [[33,33],[37,33],[37,35],[33,35]]}]'
 else
 	cat > sent-1.png
 	echo '[]'
