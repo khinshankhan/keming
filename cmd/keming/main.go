@@ -67,7 +67,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 
 	fs := flag.NewFlagSet("keming", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	lang := fs.String("l", "eng", "language, for tesseract; see tesseract --list-langs")
+	code := fs.String("l", "en", "language of the text, as an ISO 639-1 code such as fr, ko or zh-TW, when English, Chinese or Japanese reads wrong")
 	engine := fs.String("engine", "auto", "reader: auto picks per image; cells reads monospace text such as code against installed fonts; rapid is PP-OCRv6 through keming-rapidocr; tesseract")
 	verbose := fs.Bool("v", false, "say on stderr which reader's text was used")
 	fs.Usage = func() {
@@ -82,7 +82,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return errors.New("one image at a time")
 	}
 
-	name, binary, err := pickEngine(*engine, *lang, exec.LookPath)
+	lang, err := tesseractLang(*code)
+	if err != nil {
+		return err
+	}
+	name, binary, err := pickEngine(*engine, lang, exec.LookPath)
 	if err != nil {
 		return err
 	}
@@ -129,11 +133,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 	case "tesseract":
 		read = func(img image.Image) (string, error) {
-			return tesseract.Recognize(binary, *lang, upscale(img, upscaleBy))
+			return tesseract.Recognize(binary, lang, upscale(img, upscaleBy))
 		}
-		if *lang != "eng" {
+		if !readByPPOCR(lang) {
 			eachRun = func(img image.Image) (string, error) {
-				return tesseract.Recognize(binary, *lang, img)
+				return tesseract.Recognize(binary, lang, img)
 			}
 		}
 	}
@@ -213,7 +217,7 @@ func readCells(img image.Image, fonts <-chan loadedFonts) cellReading {
 // pickEngine names the reader for text that isn't monospace and finds its
 // binary: PP-OCRv6 through keming-rapidocr when it is installed, since it
 // reads web pages, chat and documents best, and tesseract otherwise, or for
-// languages other than English. -engine cells needs neither.
+// languages it doesn't read. -engine cells needs neither.
 func pickEngine(engine, lang string, lookPath func(string) (string, error)) (name, binary string, err error) {
 	tess := func() (string, string, error) {
 		binary, err := lookPath(tesseract.Binary)
@@ -237,7 +241,7 @@ func pickEngine(engine, lang string, lookPath func(string) (string, error)) (nam
 	case "rapid":
 		return pp()
 	case "auto":
-		if lang == "eng" {
+		if readByPPOCR(lang) {
 			if name, binary, err := pp(); err == nil {
 				return name, binary, nil
 			}
