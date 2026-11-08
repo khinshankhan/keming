@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"image"
 	"io/fs"
 	"math"
@@ -24,7 +25,7 @@ import (
 
 // Font is one installed monospace face that text on screen might be drawn in.
 type Font struct {
-	Name string // file name, for reporting which font was picked
+	Name string // file name, for reporting which font was picked, with #n for a collection's nth font and @weight for a variable font's instance
 	fontData
 }
 
@@ -56,7 +57,9 @@ var errNoFonts = errors.New("no monospace fonts found")
 // fontDirs are where fonts are installed, on Linux and macOS.
 func fontDirs() []string {
 	home, _ := os.UserHomeDir()
-	dirs := []string{"/usr/share/fonts", "/usr/local/share/fonts", "/System/Library/Fonts", "/Library/Fonts"}
+	dirs := []string{"/usr/share/fonts", "/usr/local/share/fonts", "/System/Library/Fonts", "/Library/Fonts",
+		// SF Mono, Terminal's default on macOS, ships inside Terminal.
+		"/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts"}
 	if home != "" {
 		dirs = append(dirs, filepath.Join(home, ".local/share/fonts"), filepath.Join(home, ".fonts"), filepath.Join(home, "Library/Fonts"))
 	}
@@ -86,8 +89,9 @@ func InstalledFonts() ([]*Font, error) {
 			if err != nil || d.IsDir() {
 				return nil
 			}
-			ext := strings.ToLower(filepath.Ext(path))
-			if ext != ".ttf" && ext != ".otf" {
+			switch strings.ToLower(filepath.Ext(path)) {
+			case ".ttf", ".otf", ".ttc", ".otc":
+			default:
 				return nil
 			}
 			real, err := filepath.EvalSymlinks(path)
@@ -101,12 +105,12 @@ func InstalledFonts() ([]*Font, error) {
 			}
 			e, ok := cache[real]
 			if !ok || e.Size != info.Size() || e.ModTime != info.ModTime().UnixNano() {
-				e = cacheEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Data: loadFont(real)}
+				e = cacheEntry{Size: info.Size(), ModTime: info.ModTime().UnixNano(), Fonts: loadFonts(real)}
 				changed = true
 			}
 			fresh[real] = e
-			if e.Data != nil {
-				out = append(out, &Font{Name: filepath.Base(real), fontData: *e.Data})
+			for _, f := range e.Fonts {
+				out = append(out, &Font{Name: f.Name, fontData: *f.Data})
 			}
 			return nil
 		})
@@ -120,8 +124,9 @@ func InstalledFonts() ([]*Font, error) {
 	return out, nil
 }
 
-// loadFont returns nil for anything that can't sit on a monospace grid.
-func loadFont(path string) *fontData {
+// loadFonts returns the usable monospace fonts in a font file, none for
+// anything that can't sit on a monospace grid.
+func loadFonts(path string) []cachedFont {
 	// Proportional Nerd Font builds keep a mono family name but vary widths.
 	if strings.Contains(strings.ToLower(filepath.Base(path)), "propo") || !fixedPitch(path) {
 		return nil
@@ -130,26 +135,82 @@ func loadFont(path string) *fontData {
 	if err != nil {
 		return nil
 	}
-	face, err := font.ParseTTF(bytes.NewReader(data))
+	return fontsIn(filepath.Base(path), data)
+}
+
+// fontsIn returns the usable monospace fonts in one font file: each font of
+// a collection, such as Menlo.ttc on macOS, and a regular and a bold from a
+// variable font, such as SF Mono or JetBrains Mono's variable build.
+func fontsIn(name string, data []byte) []cachedFont {
+	faces, err := font.ParseTTC(bytes.NewReader(data))
 	if err != nil {
 		return nil
 	}
-	return extract(face)
+	var out []cachedFont
+	for i, face := range faces {
+		n := name
+		if len(faces) > 1 {
+			n = fmt.Sprintf("%s#%d", name, i)
+		}
+		desc := face.Describe()
+		if desc.Aspect.Style != font.StyleNormal {
+			continue
+		}
+		weights := variableWeights(face)
+		if weights == nil {
+			if desc.Aspect.Weight < 350 || desc.Aspect.Weight > 700 {
+				continue
+			}
+			if d := extract(face, float32(desc.Aspect.Weight)); d != nil {
+				out = append(out, cachedFont{n, d})
+			}
+			continue
+		}
+		for _, w := range weights {
+			face.SetVariations([]font.Variation{{Tag: wght, Value: w}})
+			if d := extract(face, w); d != nil {
+				out = append(out, cachedFont{fmt.Sprintf("%s@%g", n, w), d})
+			}
+		}
+	}
+	return out
+}
+
+var wght = ot.MustNewTag("wght")
+
+// variableWeights are the weights read from a variable font: regular and
+// bold, or just regular if its weight axis stops short of bold. It is nil for
+// a font without a weight axis.
+func variableWeights(face *font.Face) []float32 {
+	defer face.SetVariations(nil)
+	at := func(w float32) []font.VarCoord {
+		face.SetVariations([]font.Variation{{Tag: wght, Value: w}})
+		return slices.Clone(face.Coords())
+	}
+	regular, bold := at(400), at(700)
+	if len(regular) == 0 || slices.Equal(regular, at(100)) && slices.Equal(regular, bold) {
+		return nil
+	}
+	if slices.Equal(regular, bold) {
+		return []float32{400}
+	}
+	return []float32{400, 700}
 }
 
 // fixedPitch reads only the post table's isFixedPitch flag, so checking every
-// installed font, some of them tens of megabytes, stays cheap.
+// installed font, some of them tens of megabytes, stays cheap. A collection
+// is judged by its first font.
 func fixedPitch(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
-	ld, err := ot.NewLoader(f)
-	if err != nil {
+	lds, err := ot.NewLoaders(f)
+	if err != nil || len(lds) == 0 {
 		return false
 	}
-	post, err := ld.RawTable(ot.MustNewTag("post"))
+	post, err := lds[0].RawTable(ot.MustNewTag("post"))
 	if err != nil || len(post) < 16 {
 		return false
 	}
@@ -158,13 +219,10 @@ func fixedPitch(path string) bool {
 
 var familySuffix = regexp.MustCompile(`(nerdfontmono|nerdfontpropo|nerdfont|nfm|nfp|nf)$`)
 
-// extract keeps what reading needs from a parsed font, or returns nil for a
-// font that isn't upright, regular to bold, and monospace.
-func extract(face *font.Face) *fontData {
+// extract keeps what reading needs from a parsed font of the given weight,
+// or returns nil for a font that isn't monospace.
+func extract(face *font.Face, weight float32) *fontData {
 	desc := face.Describe()
-	if desc.Aspect.Style != font.StyleNormal || desc.Aspect.Weight < 350 || desc.Aspect.Weight > 700 {
-		return nil
-	}
 	m, okM := face.NominalGlyph('M')
 	i, okI := face.NominalGlyph('i')
 	if !okM || !okI {
@@ -178,7 +236,7 @@ func extract(face *font.Face) *fontData {
 	upem := float32(face.Upem())
 	d := &fontData{
 		Family:   familySuffix.ReplaceAllString(fam, ""),
-		Weight:   float32(desc.Aspect.Weight),
+		Weight:   weight,
 		Advance:  float64(am) / float64(upem),
 		Upem:     upem,
 		Marks:    []float32{extreme(face, -1, 'p', 'g'), 0, face.LineMetric(font.XHeight), face.LineMetric(font.CapHeight), extreme(face, 1, 'l', 'd')},
@@ -219,25 +277,33 @@ func extract(face *font.Face) *fontData {
 	return d
 }
 
-// LoadFont reads one font file, for callers that know the font in advance.
-func LoadFont(name string, data []byte) (*Font, error) {
-	face, err := font.ParseTTF(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
+// LoadFonts reads one font file, for callers that know the font in advance:
+// each upright, regular to bold monospace font in it.
+func LoadFonts(name string, data []byte) ([]*Font, error) {
+	var out []*Font
+	for _, f := range fontsIn(name, data) {
+		out = append(out, &Font{Name: f.Name, fontData: *f.Data})
 	}
-	d := extract(face)
-	if d == nil {
-		return nil, errors.New("not an upright regular monospace font")
+	if len(out) == 0 {
+		return nil, errors.New("no upright regular to bold monospace font in " + name)
 	}
-	return &Font{Name: name, fontData: *d}, nil
+	return out, nil
 }
 
-// cacheVersion changes whenever fontData does, so old caches are ignored.
-const cacheVersion = 1
+// cacheVersion changes whenever what is cached does, so old caches are
+// ignored.
+const cacheVersion = 2
 
 type cacheEntry struct {
 	Size, ModTime int64
-	Data          *fontData // nil for a file that isn't a usable monospace font
+	Fonts         []cachedFont // none for a file without a usable monospace font
+}
+
+// cachedFont is a Font as the cache holds it; gob skips Font's embedded
+// fontData, as its type is unexported.
+type cachedFont struct {
+	Name string
+	Data *fontData
 }
 
 type fontCache map[string]cacheEntry

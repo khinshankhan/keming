@@ -20,11 +20,11 @@ import (
 // what is installed. It ships with golang.org/x/image.
 func goMono(t *testing.T) []*Font {
 	t.Helper()
-	f, err := LoadFont("gomono.ttf", gomono.TTF)
+	f, err := LoadFonts("gomono.ttf", gomono.TTF)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return []*Font{f}
+	return f
 }
 
 type theme struct {
@@ -134,7 +134,7 @@ func TestNoFontsIsAnError(t *testing.T) {
 
 func TestLoadFontRejectsProportional(t *testing.T) {
 	// Go Regular is proportional: i and M differ in width.
-	if _, err := LoadFont("goregular.ttf", goregular.TTF); err == nil {
+	if _, err := LoadFonts("goregular.ttf", goregular.TTF); err == nil {
 		t.Fatal("loaded a proportional font as monospace")
 	}
 }
@@ -161,13 +161,13 @@ func TestClippedNeighbourLinesAreIgnored(t *testing.T) {
 }
 
 func TestReadsBoldText(t *testing.T) {
-	bold, err := LoadFont("gomonobold.ttf", gomonobold.TTF)
+	bold, err := LoadFonts("gomonobold.ttf", gomonobold.TTF)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := "drag over it, print it\nl1 O0 = {quit}"
 	img := drawText(t, gomonobold.TTF, want, dark, 16)
-	got, err := Read(img, append(goMono(t), bold))
+	got, err := Read(img, append(goMono(t), bold...))
 	if err != nil {
 		t.Fatal(err)
 	}
