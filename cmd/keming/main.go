@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
@@ -32,6 +33,13 @@ const (
 	// Screen text is small for both general readers. 2x read browser and
 	// terminal text far better than the original size, and 3x was no better.
 	upscaleBy = 2
+
+	// margin is the border of background PP-OCRv6 gets on a second try when
+	// it finds nothing. It found no text in a tight selection of a Japanese
+	// title whose glyphs ran to the edge, and read it exactly with this
+	// margin. Every image gets it only on a retry: added always, it fixed one
+	// terminal line and broke two others.
+	margin = 32
 
 	// monoConfident is the cell reader's match score at which its text beats
 	// the other reader's. The cell reader turns proportional text away
@@ -95,7 +103,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			return err
 		}
 		defer r.Close()
-		read = func(img image.Image) (string, error) { return r.Read(upscale(img, upscaleBy)) }
+		read = func(img image.Image) (string, error) {
+			big := upscale(img, upscaleBy)
+			text, err := r.Read(big)
+			if !errors.Is(err, rapid.ErrNoText) {
+				return text, err
+			}
+			again, err := rapid.Start(binary)
+			if err != nil {
+				return "", err
+			}
+			defer again.Close()
+			return again.Read(padded(big, margin))
+		}
 	case "tesseract":
 		read = func(img image.Image) (string, error) {
 			return tesseract.Recognize(binary, *lang, upscale(img, upscaleBy))
@@ -243,6 +263,57 @@ func choose(cells cellReading, other textReading) (text, why string, err error) 
 		why = fmt.Sprintf("%s (cell reader match %.2f)", other.by, cells.res.Score)
 	}
 	return other.text, why, other.err
+}
+
+// padded returns img with a margin of its most common edge colour around
+// it, so text that runs to the edge of a tight selection is still found.
+func padded(img image.Image, margin int) *image.RGBA {
+	b := img.Bounds()
+	out := image.NewRGBA(image.Rect(0, 0, b.Dx()+2*margin, b.Dy()+2*margin))
+	draw.Draw(out, out.Bounds(), image.NewUniform(edgeColour(img)), image.Point{}, draw.Src)
+	draw.Draw(out, image.Rect(margin, margin, margin+b.Dx(), margin+b.Dy()), img, b.Min, draw.Src)
+	return out
+}
+
+// edgeColour is the most common colour along the edge of img, which is
+// nearly always the background.
+func edgeColour(img image.Image) color.Color {
+	b := img.Bounds()
+	counts := map[color.RGBA]int{}
+	add := func(x, y int) {
+		r, g, bl, a := img.At(x, y).RGBA()
+		counts[color.RGBA{uint8(r >> 8), uint8(g >> 8), uint8(bl >> 8), uint8(a >> 8)}]++
+	}
+	for x := b.Min.X; x < b.Max.X; x++ {
+		add(x, b.Min.Y)
+		add(x, b.Max.Y-1)
+	}
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		add(b.Min.X, y)
+		add(b.Max.X-1, y)
+	}
+	best, most := color.RGBA{255, 255, 255, 255}, 0
+	for c, n := range counts {
+		if n > most || n == most && rgbaLess(c, best) {
+			best, most = c, n
+		}
+	}
+	return best
+}
+
+// rgbaLess breaks ties between equally common colours, so the result
+// doesn't depend on map order.
+func rgbaLess(a, b color.RGBA) bool {
+	if a.R != b.R {
+		return a.R < b.R
+	}
+	if a.G != b.G {
+		return a.G < b.G
+	}
+	if a.B != b.B {
+		return a.B < b.B
+	}
+	return a.A < b.A
 }
 
 // upscale returns img enlarged by a whole factor. A smooth filter matters:

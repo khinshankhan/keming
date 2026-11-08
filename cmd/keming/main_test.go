@@ -134,6 +134,51 @@ func TestRunWithTesseract(t *testing.T) {
 	}
 }
 
+func TestRetryWithAMarginWhenPPOCRFindsNothing(t *testing.T) {
+	dir := t.TempDir()
+	// Finds nothing in the first image it is sent and reads the second,
+	// saving both, as PP-OCRv6 did with a title that ran to the edge.
+	script := `#!/bin/sh
+cd ` + dir + `
+if [ -e sent-1.png ]; then
+	cat > sent-2.png
+	echo '[{"text": "名探偵コナン", "box": [[0,0],[10,0],[10,5],[0,5]]}]'
+else
+	cat > sent-1.png
+	echo '[]'
+fi
+`
+	if err := os.WriteFile(filepath.Join(dir, "keming-rapidocr"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out, errOut bytes.Buffer
+	if err := run([]string{"-engine", "rapid"}, pngOf(t), &out, &errOut); err != nil {
+		t.Fatalf("%v: %s", err, errOut.String())
+	}
+	if out.String() != "名探偵コナン\n" {
+		t.Fatalf("printed %q, want the second reading", out.String())
+	}
+	// 3x2 at 2x is 6x4; the retry adds 32 pixels on every side.
+	for name, want := range map[string]image.Rectangle{
+		"sent-1.png": image.Rect(0, 0, 6, 4),
+		"sent-2.png": image.Rect(0, 0, 70, 68),
+	} {
+		f, err := os.Open(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, err := png.Decode(f)
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if img.Bounds() != want {
+			t.Errorf("%s is %v, want %v", name, img.Bounds(), want)
+		}
+	}
+}
+
 func TestEmptyStdinIsQuiet(t *testing.T) {
 	// A caller that started keming early sends nothing when the user cancels.
 	t.Setenv("PATH", t.TempDir())
@@ -182,5 +227,33 @@ func TestCropAndUpscale(t *testing.T) {
 				t.Errorf("pixel %d,%d: got %v, want the selection's red", x, y, got.RGBAAt(x, y))
 			}
 		}
+	}
+}
+
+func TestPaddedUsesTheEdgeColour(t *testing.T) {
+	navy := color.RGBA{21, 31, 46, 255}
+	white := color.RGBA{255, 255, 255, 255}
+	// A navy image with white text touching its right edge, as in a tight
+	// selection.
+	src := image.NewRGBA(image.Rect(10, 10, 20, 15))
+	for y := 10; y < 15; y++ {
+		for x := 10; x < 20; x++ {
+			src.SetRGBA(x, y, navy)
+		}
+	}
+	src.SetRGBA(19, 12, white)
+
+	got := padded(src, 3)
+
+	if got.Bounds() != image.Rect(0, 0, 16, 11) {
+		t.Fatalf("got bounds %v, want 16x11", got.Bounds())
+	}
+	for _, p := range []image.Point{{0, 0}, {15, 10}, {2, 5}, {15, 5}} {
+		if got.RGBAAt(p.X, p.Y) != navy {
+			t.Errorf("margin at %v is %v, want the navy background", p, got.RGBAAt(p.X, p.Y))
+		}
+	}
+	if got.RGBAAt(12, 5) != white {
+		t.Errorf("the text pixel moved: %v at 12,5", got.RGBAAt(12, 5))
 	}
 }
