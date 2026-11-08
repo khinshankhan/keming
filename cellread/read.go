@@ -3,9 +3,9 @@
 // it finds the character grid in the pixels, works out which installed font
 // drew the text, and matches each cell against that font's own glyphs.
 //
-// Experimental. It reads only printable ASCII in upright, regular to bold
-// monospace fonts installed on this machine, and assumes sharp screen pixels,
-// not video or scans.
+// Experimental. It reads only ASCII and Latin-1 letters in upright, regular
+// to bold monospace fonts installed on this machine, and assumes sharp screen
+// pixels, not video or scans.
 package cellread
 
 import (
@@ -495,7 +495,7 @@ func (pg *page) learn(t [][]float32, labels []rune, rd reading, ops map[[2]int]r
 		for i := range v {
 			v[i] /= float32(count[ch])
 		}
-		outT = append(outT, unit(v))
+		outT = append(outT, weigh(unit(v), ch))
 		outL = append(outL, ch)
 	}
 	return outT, outL

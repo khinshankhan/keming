@@ -41,7 +41,7 @@ type fontData struct {
 	// Marks are the heights snapHeights rounds, in font units: the bottom of
 	// p or g, the baseline, x-height, cap height and the top of l or d.
 	Marks    []float32
-	Glyphs   map[rune]font.GID // printable ASCII
+	Glyphs   map[rune]font.GID // ascii and latin
 	Outlines map[font.GID][]ot.Segment
 	Ops      map[string][]placed // operators shaped by the font
 }
@@ -254,7 +254,7 @@ func extract(face *font.Face, weight float32) *fontData {
 			d.Outlines[gid] = nil
 		}
 	}
-	for ch := rune(33); ch < 127; ch++ {
+	for _, ch := range append(ascii, latin...) {
 		if gid, ok := face.NominalGlyph(ch); ok {
 			d.Glyphs[ch] = gid
 			keep(gid)
@@ -292,7 +292,7 @@ func LoadFonts(name string, data []byte) ([]*Font, error) {
 
 // cacheVersion changes whenever what is cached does, so old caches are
 // ignored.
-const cacheVersion = 2
+const cacheVersion = 3
 
 type cacheEntry struct {
 	Size, ModTime int64
@@ -478,13 +478,60 @@ func coverage(z *vector.Rasterizer, w, h int) []float32 {
 // glyphs at fractional positions.
 var subPixel = []float64{0, 0.25, 0.5, 0.75}
 
-// templates draws every printable ASCII character the font has, at each
-// sub-pixel offset, as unit vectors for matching.
+// ascii is printable ASCII, apart from the space.
+var ascii = func() []rune {
+	var r []rune
+	for ch := rune('!'); ch <= '~'; ch++ {
+		r = append(r, ch)
+	}
+	return r
+}()
+
+// latin are the accented letters of Latin-1, for Spanish, German, French,
+// Portuguese and the Nordic languages, with the letters Latin-1 lacks for
+// French and Finnish, Spanish's ¡ and ¿, and the euro sign. Read as ASCII,
+// Grüße came out as GruBe. Latin-1's other symbols stay out: they look like
+// ASCII marks, and the cedilla took the underscore in LOG_LEVEL.
+var latin = func() []rune {
+	r := []rune{'¡', '¿'}
+	for ch := rune(0xc0); ch <= 0xff; ch++ {
+		if ch != '×' && ch != '÷' {
+			r = append(r, ch)
+		}
+	}
+	return append(r, 'Œ', 'œ', 'Š', 'š', 'Ž', 'ž', 'Ÿ', '€')
+}()
+
+// latinWeight scales the templates of letters outside ASCII, so they score
+// a little lower and only win a cell they clearly match. Unweighted, i read
+// as í all through a GitHub snippet in Liberation Mono; 0.98 and 0.97 read it
+// and real accents exactly, and 0.95 lost real accents.
+const latinWeight = 0.97
+
+// weigh scales v, a unit template of ch, by latinWeight when ch is outside
+// ASCII.
+func weigh(v []float32, ch rune) []float32 {
+	if ch <= '~' {
+		return v
+	}
+	for i := range v {
+		v[i] *= latinWeight
+	}
+	return v
+}
+
+// templates draws every character the font has, at each sub-pixel offset, as
+// unit vectors for matching. The quick font pass, with one offset, only
+// needs ASCII to tell fonts apart; reading needs the accented letters too.
 func (f *Font) templates(size float64, w, h int, baseline float64, phases []float64) ([][]float32, []rune) {
 	var vecs [][]float32
 	var labels []rune
 	z := vector.NewRasterizer(w, h)
-	for ch := rune(33); ch < 127; ch++ {
+	chars := ascii
+	if len(phases) > 1 {
+		chars = append(ascii[:len(ascii):len(ascii)], latin...)
+	}
+	for _, ch := range chars {
 		gid, ok := f.Glyphs[ch]
 		if !ok {
 			continue
@@ -492,7 +539,7 @@ func (f *Font) templates(size float64, w, h int, baseline float64, phases []floa
 		for _, ph := range phases {
 			z.Reset(w, h)
 			f.glyph(gid, size, ph, baseline, unhinted, z)
-			vecs = append(vecs, unit(coverage(z, w, h)))
+			vecs = append(vecs, weigh(unit(coverage(z, w, h)), ch))
 			labels = append(labels, ch)
 		}
 		if len(phases) == 1 {
@@ -503,7 +550,7 @@ func (f *Font) templates(size float64, w, h int, baseline float64, phases []floa
 			for _, ph := range []float64{0, 0.5} {
 				z.Reset(w, h)
 				f.glyph(gid, size, ph, math.Round(baseline), hint, z)
-				vecs = append(vecs, unit(coverage(z, w, h)))
+				vecs = append(vecs, weigh(unit(coverage(z, w, h)), ch))
 				labels = append(labels, ch)
 			}
 		}
