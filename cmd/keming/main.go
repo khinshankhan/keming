@@ -52,6 +52,9 @@ func main() {
 var engines = []string{"auto", "cells", "rapid", "tesseract"}
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	// Reading is a burst of work on every core; whatever the user is doing
+	// comes first. The PP-OCRv6 helper inherits this.
+	lowerPriority()
 
 	fs := flag.NewFlagSet("keming", flag.ContinueOnError)
 	fs.SetOutput(stderr)
