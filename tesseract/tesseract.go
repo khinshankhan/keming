@@ -31,7 +31,7 @@ func Recognize(binary, lang string, img image.Image) (string, error) {
 	// psm 4 reads one column of text in mixed sizes. psm 3 read ls -l output
 	// column by column, and psm 6 lost words from forms and video calls.
 	var out, stderr bytes.Buffer
-	cmd := exec.Command(binary, "stdin", "stdout", "-l", lang, "--oem", "1", "--psm", "4")
+	cmd := exec.Command(binary, args(lang)...)
 	cmd.Stdin = &in
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
@@ -45,4 +45,20 @@ func Recognize(binary, lang string, img image.Image) (string, error) {
 		return "", ErrNoText
 	}
 	return text, nil
+}
+
+// args are tesseract's arguments for lang, which may name several languages
+// joined by +.
+func args(lang string) []string {
+	a := []string{"stdin", "stdout", "-l", lang, "--oem", "1", "--psm", "4"}
+	// Without this, tesseract puts a space between every Chinese, Japanese
+	// or Korean character; Korean's real word spaces stay. It isn't used for
+	// other languages because it also keeps the wide gaps between columns of
+	// a web page or chat as runs of spaces.
+	for _, l := range strings.Split(lang, "+") {
+		if strings.HasPrefix(l, "chi_") || strings.HasPrefix(l, "jpn") || strings.HasPrefix(l, "kor") {
+			return append(a, "-c", "preserve_interword_spaces=1")
+		}
+	}
+	return a
 }

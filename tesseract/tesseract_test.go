@@ -85,3 +85,28 @@ func TestSendsTheImageOnStdin(t *testing.T) {
 		t.Fatalf("got a %v image, want 3x5", got.Bounds())
 	}
 }
+
+func TestCJKKeepsItsSpacing(t *testing.T) {
+	tests := []struct {
+		lang string
+		want bool
+	}{
+		{"eng", false},
+		{"deu", false},
+		{"jpn", true},
+		{"jpn_vert", true},
+		{"kor", true},
+		{"chi_sim", true},
+		{"chi_tra", true},
+		{"eng+kor", true},
+		{"eng+deu", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.lang, func(t *testing.T) {
+			got := strings.Contains(strings.Join(args(tt.lang), " "), "preserve_interword_spaces=1")
+			if got != tt.want {
+				t.Fatalf("preserve_interword_spaces for %s is %v, want %v", tt.lang, got, tt.want)
+			}
+		})
+	}
+}
