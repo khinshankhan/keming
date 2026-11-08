@@ -99,6 +99,38 @@ func TestRead(t *testing.T) {
 	}
 }
 
+func TestReadWithinDropsBoxesOutside(t *testing.T) {
+	// A 100x60 picture inside a 32 pixel margin, as keming's retry sends it.
+	img := image.NewRGBA(image.Rect(0, 0, 164, 124))
+	within := image.Rect(32, 32, 132, 92)
+	tests := []struct {
+		name, boxes, want string
+	}{
+		{"text inside is kept", `{"text": "名探偵", "score": 1, "box": [[45,38],[120,38],[120,90],[45,90]]}`, "名探偵"},
+		// A gradient against a flat margin read as one box over everything.
+		{"a box over the margin is dropped", `{"text": "1", "score": 0.48, "box": [[0,0],[163,0],[163,123],[0,123]]}`, ""},
+		{"a box a little over the edge is kept", `{"text": "ok", "score": 0.9, "box": [[20,30],[60,30],[60,50],[20,50]]}`, "ok"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := Start(fake(t, "cat >/dev/null; printf '%s' '["+tt.boxes+"]'"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := r.ReadWithin(img, within)
+			if tt.want == "" {
+				if !errors.Is(err, ErrNoText) {
+					t.Fatalf("got %q, %v, want ErrNoText", got, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("got %q, %v, want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestCloseStopsAnUnusedHelper(t *testing.T) {
 	// Stands in for a helper still loading its models.
 	r, err := Start(fake(t, `exec sleep 30`))

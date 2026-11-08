@@ -52,6 +52,30 @@ func Start(binary string) (*Reader, error) {
 // image goes over stdin so a screenshot never lands in a temp file. A Reader
 // reads once.
 func (r *Reader) Read(img image.Image) (string, error) {
+	return r.read(img, func(box) bool { return true })
+}
+
+// ReadWithin reads img, as Read does, keeping only the text found within
+// part of it, for a picture sent with a margin around it. A box may reach
+// half the margin past the part, as boxes are drawn a little wider than
+// their text; one reaching further is something the margin made, such as
+// the edge between a gradient and a flat margin, read as 1.
+func (r *Reader) ReadWithin(img image.Image, within image.Rectangle) (string, error) {
+	slack := min(within.Min.X-img.Bounds().Min.X, within.Min.Y-img.Bounds().Min.Y) / 2
+	outer := within.Inset(-slack)
+	return r.read(img, func(b box) bool {
+		for _, p := range b.Box {
+			if !image.Pt(int(p[0]), int(p[1])).In(outer) {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// read sends img to the helper and puts the boxes it finds, those keep
+// accepts, into lines.
+func (r *Reader) read(img image.Image, keep func(box) bool) (string, error) {
 	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
 	err := encoder.Encode(r.stdin, img)
 	if cerr := r.stdin.Close(); err == nil {
@@ -67,6 +91,7 @@ func (r *Reader) Read(img image.Image) (string, error) {
 	if err := json.Unmarshal(r.out.Bytes(), &boxes); err != nil {
 		return "", fmt.Errorf("%s: %w", Binary, err)
 	}
+	boxes = slices.DeleteFunc(boxes, func(b box) bool { return !keep(b) })
 	text := assembleLines(boxes)
 	if text == "" {
 		return "", ErrNoText
