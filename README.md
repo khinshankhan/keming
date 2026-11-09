@@ -42,4 +42,8 @@ Two of the cell reader's tests read screenshots kept out of the repository;
 they run when `KEMING_FIXTURES` names a folder holding them, and are
 skipped otherwise.
 
-Experimental. Licensed under the Apache License 2.0; see `LICENSE`.
+Experimental.
+
+## License
+
+Apache-2.0. See [LICENSE](./LICENSE). If applicable, see [NOTICE](./NOTICE).
