@@ -1,12 +1,13 @@
 # keming
 
-> it can tell rn from m
+> Offline OCR that knows which font you're using, and judges you for it.
 
-Offline OCR that knows which font you're using, and judges you for it.
 Named after the mistake it doesn't make: bad kerning turns "kerning" into
-"keming".
+"keming". It can tell rn from m.
 
-    keming [-l lang] [-engine name] [-v] [image]
+```
+keming [-l lang] [-engine name] [-v] [image]
+```
 
 Reads a screenshot, from a file or as PNG or JPEG on stdin, and prints its
 text. It picks the reader per image:
@@ -37,4 +38,8 @@ keming loads fonts and models before it reads stdin, so a caller can start it
 early and send the image when it has one; frame's `extract` does this while
 the area is picked. Empty stdin exits quietly.
 
-Experimental, and private until frame takes it up.
+Two of the cell reader's tests read screenshots kept out of the repository;
+they run when `KEMING_FIXTURES` names a folder holding them, and are
+skipped otherwise.
+
+Experimental. Licensed under the Apache License 2.0; see `LICENSE`.

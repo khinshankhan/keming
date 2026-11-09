@@ -8,11 +8,13 @@ It reads a PNG on stdin and prints the boxes it finds as JSON.
 
 Setup, in a virtual environment of your choice:
 
-    python3 -m venv ~/.local/share/keming-rapidocr
-    ~/.local/share/keming-rapidocr/bin/pip install rapidocr onnxruntime
-    printf '#!/bin/sh\nexec ~/.local/share/keming-rapidocr/bin/python -I %s "$@"\n' \
-        "$PWD/keming-rapidocr" > ~/.local/bin/keming-rapidocr
-    chmod +x ~/.local/bin/keming-rapidocr
+```sh
+python3 -m venv ~/.local/share/keming-rapidocr
+~/.local/share/keming-rapidocr/bin/pip install rapidocr onnxruntime
+printf '#!/bin/sh\nexec ~/.local/share/keming-rapidocr/bin/python -I %s "$@"\n' \
+    "$PWD/keming-rapidocr" > ~/.local/bin/keming-rapidocr
+chmod +x ~/.local/bin/keming-rapidocr
+```
 
 RapidOCR downloads its models on the first run; after that it runs offline.
 It uses 4 threads and 450 to 750MB of memory while it reads.
