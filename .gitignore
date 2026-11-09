@@ -1,1 +1,10 @@
 /bin/
+
+# No images in this repository: test screenshots live in KEMING_FIXTURES.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.ico
